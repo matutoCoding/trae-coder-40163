@@ -1,0 +1,28 @@
+{
+  "name": "voice-transcription-service",
+  "version": "1.0.0",
+  "description": "面向语音转写产品开发者的后端服务，提供会议录音声纹分离的标准接口",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "node --watch src/app.js",
+    "test": "jest --testTimeout=10000 --verbose",
+    "init-db": "node src/scripts/init-db.js"
+  },
+  "keywords": ["voice", "transcription", "speaker-diarization", "asr", "meeting"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "express": "^4.19.2",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["**/tests/**/*.test.js"]
+  }
+}
