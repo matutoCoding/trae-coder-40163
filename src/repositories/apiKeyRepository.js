@@ -2,19 +2,80 @@ const db = require('../db');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 
-const generateApiKey = (appName, teamId = null) => {
+const ALL_PERMISSIONS = ['admin', 'tasks:write', 'tasks:read', 'feedback:write'];
+
+const normalizePermissions = (permissions) => {
+  if (!Array.isArray(permissions) || permissions.length === 0) {
+    return ['tasks:read'];
+  }
+  const uniq = [...new Set(permissions.filter((p) => typeof p === 'string'))];
+  const filtered = uniq.filter((p) => ALL_PERMISSIONS.includes(p));
+  return filtered.length ? filtered : ['tasks:read'];
+};
+
+const normalizeTeamIds = (teamIds) => {
+  if (!Array.isArray(teamIds)) return null;
+  const filtered = teamIds.filter((t) => typeof t === 'string' && t.trim().length > 0);
+  return filtered.length ? filtered : null;
+};
+
+const parsePerms = (row) => {
+  try {
+    const arr = JSON.parse(row.permissions || '[]');
+    return Array.isArray(arr) ? arr : [];
+  } catch (_) {
+    return [];
+  }
+};
+
+const parseTeams = (row) => {
+  if (!row.allowed_team_ids) return null;
+  try {
+    const arr = JSON.parse(row.allowed_team_ids);
+    return Array.isArray(arr) ? arr : null;
+  } catch (_) {
+    return null;
+  }
+};
+
+const maskKeyRow = (row) => ({
+  id: row.id,
+  appId: row.app_id,
+  appName: row.app_name,
+  keyPrefix: row.key_prefix,
+  teamId: row.team_id,
+  permissions: parsePerms(row),
+  allowedTeamIds: parseTeams(row),
+  isActive: row.is_active === 1,
+  createdAt: row.created_at,
+  revokedAt: row.revoked_at
+});
+
+const generateApiKey = (appName, teamId = null, options = {}) => {
   const rawKey = `vts_${crypto.randomBytes(24).toString('hex')}`;
   const keyHash = hashKey(rawKey);
   const keyPrefix = rawKey.slice(0, 8);
-  const appId = `app_${uuidv4().replace(/-/g, '').slice(0, 12)}`;
+  const appId = options.appId || `app_${uuidv4().replace(/-/g, '').slice(0, 12)}`;
   const id = uuidv4();
   const createdAt = Date.now();
+  const permissions = normalizePermissions(options.permissions);
+  const allowedTeamIds = normalizeTeamIds(options.allowedTeamIds);
 
   const stmt = db.prepare(`
-    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, is_active, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, permissions, allowed_team_ids, is_active, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
   `);
-  stmt.run(id, appId, appName, keyHash, keyPrefix, teamId || null, createdAt);
+  stmt.run(
+    id,
+    appId,
+    appName,
+    keyHash,
+    keyPrefix,
+    teamId || null,
+    JSON.stringify(permissions),
+    allowedTeamIds ? JSON.stringify(allowedTeamIds) : null,
+    createdAt
+  );
 
   return {
     id,
@@ -23,6 +84,8 @@ const generateApiKey = (appName, teamId = null) => {
     apiKey: rawKey,
     keyPrefix,
     teamId: teamId || null,
+    permissions,
+    allowedTeamIds,
     createdAt
   };
 };
@@ -35,7 +98,7 @@ const validateKey = (rawKey) => {
   if (!rawKey || typeof rawKey !== 'string') return null;
   const keyHash = hashKey(rawKey);
   const row = db.prepare(`
-    SELECT id, app_id, app_name, key_prefix, team_id, is_active
+    SELECT id, app_id, app_name, key_prefix, team_id, permissions, allowed_team_ids, is_active
     FROM api_keys WHERE key_hash = ? AND is_active = 1
   `).get(keyHash);
   if (!row) return null;
@@ -44,33 +107,57 @@ const validateKey = (rawKey) => {
     appId: row.app_id,
     appName: row.app_name,
     keyPrefix: row.key_prefix,
-    teamId: row.team_id
+    teamId: row.team_id,
+    permissions: parsePerms(row),
+    allowedTeamIds: parseTeams(row)
   };
 };
 
-const revokeKey = (id) => {
-  const result = db.prepare(`
-    UPDATE api_keys SET is_active = 0, revoked_at = ? WHERE id = ?
-  `).run(Date.now(), id);
-  return result.changes > 0;
+const getKeyById = (id) => {
+  const row = db.prepare('SELECT * FROM api_keys WHERE id = ?').get(id);
+  return row ? maskKeyRow(row) : null;
 };
 
 const getKeysByAppId = (appId) => {
   const rows = db.prepare(`
-    SELECT id, app_id, app_name, key_prefix, team_id, is_active, created_at, revoked_at
-    FROM api_keys WHERE app_id = ?
-    ORDER BY created_at DESC
+    SELECT * FROM api_keys WHERE app_id = ? ORDER BY created_at DESC
   `).all(appId);
-  return rows.map((r) => ({
-    id: r.id,
-    appId: r.app_id,
-    appName: r.app_name,
-    keyPrefix: r.key_prefix,
-    teamId: r.team_id,
-    isActive: r.is_active === 1,
-    createdAt: r.created_at,
-    revokedAt: r.revoked_at
-  }));
+  return rows.map(maskKeyRow);
+};
+
+const revokeKey = (id) => {
+  const result = db.prepare(`
+    UPDATE api_keys SET is_active = 0, revoked_at = ? WHERE id = ? AND is_active = 1
+  `).run(Date.now(), id);
+  return result.changes > 0;
+};
+
+const updateKey = (id, updates = {}) => {
+  const existing = getKeyById(id);
+  if (!existing) return null;
+
+  const fields = [];
+  const params = [];
+
+  if (updates.appName !== undefined) {
+    fields.push('app_name = ?');
+    params.push(updates.appName);
+  }
+  if (updates.permissions !== undefined) {
+    fields.push('permissions = ?');
+    params.push(JSON.stringify(normalizePermissions(updates.permissions)));
+  }
+  if (updates.allowedTeamIds !== undefined) {
+    const arr = normalizeTeamIds(updates.allowedTeamIds);
+    fields.push('allowed_team_ids = ?');
+    params.push(arr ? JSON.stringify(arr) : null);
+  }
+
+  if (!fields.length) return existing;
+
+  params.push(id);
+  db.prepare(`UPDATE api_keys SET ${fields.join(', ')} WHERE id = ?`).run(...params);
+  return getKeyById(id);
 };
 
 const TEST_APP_ID = 'app_test_default';
@@ -81,17 +168,28 @@ const ensureTestKey = () => {
   const existing = db.prepare('SELECT id FROM api_keys WHERE key_hash = ?').get(keyHash);
   if (existing) return;
   db.prepare(`
-    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, is_active, created_at)
-    VALUES (?, ?, ?, ?, ?, NULL, 1, ?)
-  `).run('test-key-id', TEST_APP_ID, 'Test App', keyHash, TEST_API_KEY.slice(0, 8), Date.now());
+    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, permissions, allowed_team_ids, is_active, created_at)
+    VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, 1, ?)
+  `).run(
+    'test-key-id',
+    TEST_APP_ID,
+    'Test App',
+    keyHash,
+    TEST_API_KEY.slice(0, 8),
+    JSON.stringify(['admin', 'tasks:write', 'tasks:read', 'feedback:write']),
+    Date.now()
+  );
 };
 
 module.exports = {
   generateApiKey,
   validateKey,
-  revokeKey,
+  getKeyById,
   getKeysByAppId,
+  revokeKey,
+  updateKey,
   ensureTestKey,
   TEST_APP_ID,
-  TEST_API_KEY
+  TEST_API_KEY,
+  ALL_PERMISSIONS
 };

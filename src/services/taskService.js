@@ -28,7 +28,7 @@ const {
   buildSpeakerRenamesByTeam,
   getTeamLearningOverview
 } = require('../repositories/feedbackRepository');
-const { createCallbackLog, getCallbackLogsByTaskId } = require('../repositories/callbackRepository');
+const { createCallbackLog, getCallbackLogsByTaskId, getLatestFailedLog } = require('../repositories/callbackRepository');
 const { simulateDiarization } = require('./transcriptionEngine');
 
 const CALLBACK_MAX_RETRIES = 3;
@@ -94,7 +94,7 @@ class TaskService {
       const hintCount = payload.participants ? payload.participants.length : 0;
       const rawSegments = simulateDiarization(task.audioUrl, task.meetingName, hintCount);
 
-      const renames = task.teamId ? buildSpeakerRenamesByTeam(task.teamId) : {};
+      const renames = task.teamId ? buildSpeakerRenamesByTeam(task.teamId, task.appId) : {};
       const mappedSegments = rawSegments.map((s) => ({
         ...s,
         speakerLabel: renames[s.speakerLabel] || s.speakerLabel
@@ -344,39 +344,53 @@ class TaskService {
 
     const taskSegments = getSegmentsByTaskId(taskId);
     const segmentIdSet = new Set(taskSegments.map((s) => s.id));
-
-    const validated = [];
-    const errors = [];
     const ts = now();
 
     for (let i = 0; i < corrections.length; i++) {
       const c = corrections[i];
       const ownershipError = this._checkSegmentOwnership(c, segmentIdSet);
       if (ownershipError) {
-        errors.push({ index: i, ...ownershipError });
-        continue;
+        return {
+          httpStatus: 400,
+          error: {
+            code: ownershipError.code || 'SEGMENT_NOT_BELONG',
+            message: `corrections[${i}]: ${ownershipError.message}`,
+            index: i,
+            details: ownershipError
+          }
+        };
       }
-      const check = this._applyCorrection(taskId, c, ts);
-      if (check.error) {
-        errors.push({ index: i, ...check.error });
-      } else {
-        validated.push({
-          ...c,
-          feedbackType: c.type,
-          createdAt: ts,
-          teamId: teamId || task.teamId
-        });
+      const validation = this._validateCorrection(c);
+      if (validation) {
+        return {
+          httpStatus: 400,
+          error: {
+            code: validation.code || 'INVALID_CORRECTION',
+            message: `corrections[${i}]: ${validation.message}`,
+            index: i,
+            details: validation
+          }
+        };
       }
     }
 
-    const saved = validated.length > 0 ? createFeedback(taskId, validated) : [];
+    const savedList = [];
+    for (const c of corrections) {
+      const apply = this._applyCorrection(taskId, c, ts);
+      if (apply.error) continue;
+      savedList.push({
+        ...c,
+        feedbackType: c.type,
+        createdAt: ts,
+        teamId: teamId || task.teamId
+      });
+    }
+    const saved = savedList.length > 0 ? createFeedback(taskId, savedList) : [];
 
     return {
       data: {
         taskId,
         appliedCount: saved.length,
-        skippedCount: errors.length,
-        errors,
         feedbacks: saved.map((f) => ({
           id: f.id,
           feedbackType: f.feedbackType,
@@ -387,6 +401,38 @@ class TaskService {
         }))
       }
     };
+  }
+
+  _validateCorrection(correction) {
+    const { type } = correction;
+    if (!type) return { code: 'MISSING_TYPE', message: '缺少修正类型 type' };
+    switch (type) {
+      case FeedbackType.SPEAKER_RENAME: {
+        if (!correction.newSpeakerLabel) return { code: 'MISSING_NEW_LABEL', message: '缺少新的发言人标签' };
+        if (correction.scope === 'segment' && !correction.segmentId) {
+          return { code: 'MISSING_SEGMENT_ID', message: '分段模式下必须指定 segmentId' };
+        }
+        if ((correction.scope === 'task' || correction.scope === 'team') && !correction.oldSpeakerLabel && !correction.segmentId) {
+          return { code: 'MISSING_OLD_LABEL', message: '任务/团队级别重命名需要指定旧发言人标签' };
+        }
+        return null;
+      }
+      case FeedbackType.SEGMENT_MERGE: {
+        if (!Array.isArray(correction.segmentIds) || correction.segmentIds.length < 2) {
+          return { code: 'INVALID_SEGMENT_IDS', message: '合并至少需要 2 个片段 ID' };
+        }
+        return null;
+      }
+      case FeedbackType.TEXT_CORRECTION: {
+        if (!correction.segmentId) return { code: 'MISSING_SEGMENT_ID', message: '必须指定 segmentId' };
+        if (correction.newText === undefined || correction.newText === null) {
+          return { code: 'MISSING_NEW_TEXT', message: '缺少修正后的文本' };
+        }
+        return null;
+      }
+      default:
+        return { code: 'UNKNOWN_TYPE', message: `不支持的修正类型: ${type}` };
+    }
   }
 
   _checkSegmentOwnership(correction, segmentIdSet) {
@@ -516,6 +562,127 @@ class TaskService {
 
   getTeamLearning(teamId, appId) {
     return getTeamLearningOverview(teamId, appId);
+  }
+
+  getCallbackHistory(taskId, appId) {
+    const task = appId ? getTaskByIdAndAppId(taskId, appId) : getTaskById(taskId);
+    if (!task) {
+      return { error: { code: 'TASK_NOT_FOUND', message: '任务不存在或无权访问' }, httpStatus: 404 };
+    }
+    if (!task.callbackUrl) {
+      return { data: { taskId, url: null, logs: [], status: task.callbackStatus || 'not_configured' } };
+    }
+    const logs = getCallbackLogsByTaskId(taskId, 50);
+    return {
+      data: {
+        taskId,
+        url: task.callbackUrl,
+        status: task.callbackStatus || 'pending',
+        attempts: task.callbackAttempts || 0,
+        lastCallbackAt: task.lastCallbackAt,
+        logs: logs.map((l) => ({
+          id: l.id,
+          attempt: l.attempt,
+          statusCode: l.statusCode,
+          responseBody: l.responseBody,
+          createdAt: l.createdAt,
+          nextRetryAt: l.nextRetryAt
+        }))
+      }
+    };
+  }
+
+  retryCallback(taskId, appId) {
+    const task = appId ? getTaskByIdAndAppId(taskId, appId) : getTaskById(taskId);
+    if (!task) {
+      return { error: { code: 'TASK_NOT_FOUND', message: '任务不存在或无权访问' }, httpStatus: 404 };
+    }
+    if (!task.callbackUrl) {
+      return { error: { code: 'CALLBACK_NOT_CONFIGURED', message: '该任务未配置回调地址' }, httpStatus: 400 };
+    }
+    const failed = getLatestFailedLog(taskId);
+    const attempt = failed ? failed.attempt + 1 : (task.callbackAttempts || 0) + 1;
+    if (attempt > CALLBACK_MAX_RETRIES) {
+      return { error: { code: 'MAX_RETRIES_EXCEEDED', message: `重放次数超过上限(${CALLBACK_MAX_RETRIES}次)` }, httpStatus: 400 };
+    }
+    this._fireCallbackWithRetry(task.callbackUrl, taskId, attempt);
+    return {
+      data: {
+        taskId,
+        attempt,
+        status: 'retrying',
+        message: '已触发重放，请稍后查询任务确认回调状态'
+      }
+    };
+  }
+
+  batchGetTaskSummaries(taskIds, appId) {
+    if (!Array.isArray(taskIds) || taskIds.length === 0) {
+      return { error: { code: 'EMPTY_TASK_IDS', message: 'taskIds 必须是非空数组' }, httpStatus: 400 };
+    }
+    if (taskIds.length > 100) {
+      return { error: { code: 'TOO_MANY_TASKS', message: '单次最多查询 100 个任务' }, httpStatus: 400 };
+    }
+    const results = [];
+    for (const tid of taskIds) {
+      if (!tid || typeof tid !== 'string') {
+        results.push({ taskId: tid, code: 'INVALID_ID', status: 'error', error: 'taskId 必须为非空字符串' });
+        continue;
+      }
+      try {
+        const task = appId ? getTaskByIdAndAppId(tid, appId) : getTaskById(tid);
+        if (!task) {
+          const raw = getTaskById(tid);
+          if (raw) {
+            results.push({ taskId: tid, code: 'FORBIDDEN', status: 'forbidden', error: '无权访问此任务' });
+          } else {
+            results.push({ taskId: tid, code: 'NOT_FOUND', status: 'not_found', error: '任务不存在' });
+          }
+          continue;
+        }
+        if (task.status !== TaskStatus.COMPLETED) {
+          results.push({
+            taskId: tid,
+            code: task.status.toUpperCase(),
+            status: 'processing',
+            meetingName: task.meetingName,
+            teamId: task.teamId,
+            progress: this._calcProgress(task),
+            createdAt: task.createdAt
+          });
+          continue;
+        }
+        const segments = getSegmentsByTaskId(tid);
+        const participants = getParticipantsByTaskId(tid);
+        const bySpeaker = this._groupBySpeaker(segments);
+        const speakers = this._buildSpeakers(bySpeaker, participants);
+        results.push({
+          taskId: tid,
+          code: 'OK',
+          status: 'success',
+          meetingName: task.meetingName,
+          teamId: task.teamId,
+          createdAt: task.createdAt,
+          completedAt: task.completedAt,
+          segmentCount: segments.length,
+          speakerCount: speakers.length,
+          speakers: speakers.map((s) => ({
+            speakerLabel: s.speakerLabel,
+            displayName: s.displayName,
+            segmentCount: s.segmentCount,
+            totalDuration: s.totalDuration
+          })),
+          callback: task.callbackUrl ? {
+            status: task.callbackStatus,
+            attempts: task.callbackAttempts || 0,
+            lastCallbackAt: task.lastCallbackAt
+          } : null
+        });
+      } catch (e) {
+        results.push({ taskId: tid, code: 'INTERNAL_ERROR', status: 'error', error: e.message });
+      }
+    }
+    return { data: { results, total: results.length } };
   }
 }
 

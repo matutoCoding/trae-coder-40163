@@ -9,6 +9,8 @@ const initDatabase = () => {
       key_hash TEXT NOT NULL,
       key_prefix TEXT NOT NULL,
       team_id TEXT,
+      permissions TEXT NOT NULL DEFAULT '["admin"]',
+      allowed_team_ids TEXT,
       is_active INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL,
       revoked_at INTEGER

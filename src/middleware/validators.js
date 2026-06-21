@@ -112,6 +112,72 @@ const validateFeedback = (req, res, next) => {
   next();
 };
 
+const validateCreateApiKey = (req, res, next) => {
+  const { appName, teamId, permissions, allowedTeamIds } = req.body || {};
+  const errors = [];
+  const ALLOWED_PERMS = new Set(['admin', 'tasks:write', 'tasks:read', 'feedback:write']);
+
+  if (!appName || typeof appName !== 'string' || appName.trim().length === 0) {
+    errors.push({ field: 'appName', message: '应用名称必填' });
+  } else if (appName.length > 100) {
+    errors.push({ field: 'appName', message: '应用名称长度不能超过 100' });
+  }
+  if (teamId !== undefined && teamId !== null && typeof teamId !== 'string') {
+    errors.push({ field: 'teamId', message: 'teamId 必须为字符串' });
+  }
+  if (permissions !== undefined) {
+    if (!Array.isArray(permissions)) {
+      errors.push({ field: 'permissions', message: 'permissions 必须为字符串数组' });
+    } else {
+      permissions.forEach((p, i) => {
+        if (typeof p !== 'string' || !ALLOWED_PERMS.has(p)) {
+          errors.push({ field: `permissions[${i}]`, message: `不支持的权限值: ${p}` });
+        }
+      });
+    }
+  }
+  if (allowedTeamIds !== undefined) {
+    if (!Array.isArray(allowedTeamIds)) {
+      errors.push({ field: 'allowedTeamIds', message: 'allowedTeamIds 必须为字符串数组或省略' });
+    } else {
+      allowedTeamIds.forEach((t, i) => {
+        if (typeof t !== 'string' || t.trim().length === 0) {
+          errors.push({ field: `allowedTeamIds[${i}]`, message: '团队 ID 必须为非空字符串' });
+        }
+      });
+    }
+  }
+
+  if (errors.length > 0) {
+    return res.status(400).json({
+      code: 'VALIDATION_ERROR',
+      message: '请求参数校验失败',
+      errors
+    });
+  }
+  next();
+};
+
+const validateBatchGetTasks = (req, res, next) => {
+  const { taskIds } = req.body || {};
+  const errors = [];
+  if (!Array.isArray(taskIds)) {
+    errors.push({ field: 'taskIds', message: 'taskIds 必须为非空字符串数组' });
+  } else if (taskIds.length === 0) {
+    errors.push({ field: 'taskIds', message: 'taskIds 不能为空数组' });
+  } else if (taskIds.length > 100) {
+    errors.push({ field: 'taskIds', message: 'taskIds 单次最多 100 个' });
+  }
+  if (errors.length > 0) {
+    return res.status(400).json({
+      code: 'VALIDATION_ERROR',
+      message: '请求参数校验失败',
+      errors
+    });
+  }
+  next();
+};
+
 const requestLogger = (req, _res, next) => {
   if (process.env.NODE_ENV === 'test') return next();
   const ts = new Date().toISOString();
@@ -122,5 +188,7 @@ const requestLogger = (req, _res, next) => {
 module.exports = {
   validateSubmitTask,
   validateFeedback,
+  validateCreateApiKey,
+  validateBatchGetTasks,
   requestLogger
 };

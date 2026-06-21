@@ -52,14 +52,21 @@ const getFeedbackByTaskId = (taskId) => {
   return rows.map(mapFeedback);
 };
 
-const getFeedbackByTeamId = (teamId, feedbackType = null, limit = 100) => {
-  let sql = 'SELECT * FROM feedback WHERE team_id = ?';
+const getFeedbackByTeamId = (teamId, feedbackType = null, limit = 100, appId = null) => {
+  let sql = `
+    SELECT f.* FROM feedback f
+    WHERE f.team_id = ?
+  `;
   const params = [teamId];
+  if (appId) {
+    sql += ' AND f.task_id IN (SELECT id FROM tasks WHERE app_id = ?)';
+    params.push(appId);
+  }
   if (feedbackType) {
-    sql += ' AND feedback_type = ?';
+    sql += ' AND f.feedback_type = ?';
     params.push(feedbackType);
   }
-  sql += ' ORDER BY created_at DESC LIMIT ?';
+  sql += ' ORDER BY f.created_at DESC LIMIT ?';
   params.push(limit);
   const rows = db.prepare(sql).all(...params);
   return rows.map(mapFeedback);
@@ -70,9 +77,9 @@ const markFeedbackApplied = (id) => {
   return result.changes > 0;
 };
 
-const buildSpeakerRenamesByTeam = (teamId) => {
+const buildSpeakerRenamesByTeam = (teamId, appId = null) => {
   if (!teamId) return {};
-  const renames = getFeedbackByTeamId(teamId, FeedbackType.SPEAKER_RENAME, 500);
+  const renames = getFeedbackByTeamId(teamId, FeedbackType.SPEAKER_RENAME, 500, appId);
   const map = {};
   const applied = new Set();
   for (const r of renames) {
@@ -104,18 +111,23 @@ const getTeamLearningOverview = (teamId, appId) => {
     totalFeedback += row.count;
   }
 
-  const renameRows = db.prepare(`
-    SELECT DISTINCT old_value, new_value
-    FROM feedback
-    WHERE team_id = ? AND feedback_type = ? AND old_value IS NOT NULL
-    ORDER BY created_at DESC LIMIT 50
-  `).all(teamId, FeedbackType.SPEAKER_RENAME);
+  const renameRowsSql = `
+    SELECT DISTINCT f.old_value, f.new_value
+    FROM feedback f
+    WHERE f.team_id = ? AND f.feedback_type = ? AND f.old_value IS NOT NULL
+    ${appId ? ' AND f.task_id IN (SELECT id FROM tasks WHERE app_id = ?)' : ''}
+    ORDER BY f.created_at DESC LIMIT 50
+  `;
+  const renameParams = appId
+    ? [teamId, FeedbackType.SPEAKER_RENAME, appId]
+    : [teamId, FeedbackType.SPEAKER_RENAME];
+  const renameRows = db.prepare(renameRowsSql).all(...renameParams);
   const speakerMappings = renameRows.map((r) => ({
     from: r.old_value,
     to: r.new_value
   }));
 
-  const recentFeedback = getFeedbackByTeamId(teamId, null, 10);
+  const recentFeedback = getFeedbackByTeamId(teamId, null, 10, appId);
 
   const taskCountRow = db.prepare(`
     SELECT COUNT(DISTINCT f.task_id) as count

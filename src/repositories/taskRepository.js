@@ -89,13 +89,17 @@ const updateTaskStatus = (id, status, extra = {}) => {
   return result.changes > 0;
 };
 
-const queryTasks = ({ appId, teamId, status, startTime, endTime, limit = 20, offset = 0 }) => {
+const queryTasks = ({ appId, teamId, allowedTeamIds, status, startTime, endTime, limit = 20, offset = 0 }) => {
   const conditions = ['t.app_id = ?'];
   const params = [appId];
 
   if (teamId) {
     conditions.push('t.team_id = ?');
     params.push(teamId);
+  } else if (Array.isArray(allowedTeamIds) && allowedTeamIds.length > 0) {
+    const placeholders = allowedTeamIds.map(() => '?').join(',');
+    conditions.push(`t.team_id IN (${placeholders})`);
+    params.push(...allowedTeamIds);
   }
   if (status) {
     conditions.push('t.status = ?');

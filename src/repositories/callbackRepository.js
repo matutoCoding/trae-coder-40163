@@ -12,11 +12,11 @@ const createCallbackLog = ({ taskId, url, payload, statusCode, responseBody, att
   return info.lastInsertRowid;
 };
 
-const getCallbackLogsByTaskId = (taskId) => {
+const getCallbackLogsByTaskId = (taskId, limit = 50) => {
   const rows = db.prepare(`
     SELECT * FROM callback_logs WHERE task_id = ?
-    ORDER BY created_at DESC LIMIT 10
-  `).all(taskId);
+    ORDER BY created_at DESC LIMIT ?
+  `).all(taskId, limit);
   return rows.map((r) => ({
     id: r.id,
     taskId: r.task_id,
@@ -28,6 +28,26 @@ const getCallbackLogsByTaskId = (taskId) => {
     createdAt: r.created_at,
     nextRetryAt: r.next_retry_at
   }));
+};
+
+const getLatestFailedLog = (taskId) => {
+  const row = db.prepare(`
+    SELECT * FROM callback_logs
+    WHERE task_id = ? AND (status_code IS NULL OR status_code < 200 OR status_code >= 300)
+    ORDER BY created_at DESC LIMIT 1
+  `).get(taskId);
+  if (!row) return null;
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    url: row.url,
+    payload: row.payload,
+    statusCode: row.status_code,
+    responseBody: row.response_body,
+    attempt: row.attempt,
+    createdAt: row.created_at,
+    nextRetryAt: row.next_retry_at
+  };
 };
 
 const getPendingRetries = (beforeTs) => {
@@ -54,6 +74,7 @@ const clearNextRetry = (id) => {
 module.exports = {
   createCallbackLog,
   getCallbackLogsByTaskId,
+  getLatestFailedLog,
   getPendingRetries,
   clearNextRetry
 };
