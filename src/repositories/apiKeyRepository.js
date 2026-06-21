@@ -46,20 +46,27 @@ const computeKeyStatus = (row) => {
   return 'effective';
 };
 
-const maskKeyRow = (row) => ({
-  id: row.id,
-  appId: row.app_id,
-  appName: row.app_name,
-  keyPrefix: row.key_prefix,
-  teamId: row.team_id,
-  permissions: parsePerms(row),
-  allowedTeamIds: parseTeams(row),
-  isActive: row.is_active === 1,
-  status: computeKeyStatus(row),
-  gracePeriodUntil: row.grace_period_until || null,
-  createdAt: row.created_at,
-  revokedAt: row.revoked_at
-});
+const maskKeyRow = (row) => {
+  let dailyQuota = null;
+  if (row.daily_quota) {
+    try { dailyQuota = JSON.parse(row.daily_quota); } catch (_) {}
+  }
+  return {
+    id: row.id,
+    appId: row.app_id,
+    appName: row.app_name,
+    keyPrefix: row.key_prefix,
+    teamId: row.team_id,
+    permissions: parsePerms(row),
+    allowedTeamIds: parseTeams(row),
+    dailyQuota: dailyQuota || null,
+    isActive: row.is_active === 1,
+    status: computeKeyStatus(row),
+    gracePeriodUntil: row.grace_period_until || null,
+    createdAt: row.created_at,
+    revokedAt: row.revoked_at
+  };
+};
 
 const generateApiKey = (appName, teamId = null, options = {}) => {
   const rawKey = `vts_${crypto.randomBytes(24).toString('hex')}`;
@@ -73,10 +80,11 @@ const generateApiKey = (appName, teamId = null, options = {}) => {
   const gracePeriodUntil = options.gracePeriodMinutes
     ? createdAt + options.gracePeriodMinutes * 60 * 1000
     : null;
+  const dailyQuota = options.dailyQuota ? JSON.stringify(options.dailyQuota) : null;
 
   const stmt = db.prepare(`
-    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, permissions, allowed_team_ids, is_active, grace_period_until, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, permissions, allowed_team_ids, daily_quota, is_active, grace_period_until, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
   `);
   stmt.run(
     id,
@@ -87,6 +95,7 @@ const generateApiKey = (appName, teamId = null, options = {}) => {
     teamId || null,
     JSON.stringify(permissions),
     allowedTeamIds ? JSON.stringify(allowedTeamIds) : null,
+    dailyQuota,
     gracePeriodUntil,
     createdAt
   );
@@ -100,6 +109,7 @@ const generateApiKey = (appName, teamId = null, options = {}) => {
     teamId: teamId || null,
     permissions,
     allowedTeamIds,
+    dailyQuota: options.dailyQuota || null,
     gracePeriodUntil,
     createdAt
   };
@@ -140,6 +150,10 @@ const validateKey = (rawKey) => {
 const getKeyById = (id) => {
   const row = db.prepare('SELECT * FROM api_keys WHERE id = ?').get(id);
   return row ? maskKeyRow(row) : null;
+};
+
+const getRawKeyById = (id) => {
+  return db.prepare('SELECT * FROM api_keys WHERE id = ?').get(id);
 };
 
 const getKeysByAppId = (appId) => {
@@ -201,6 +215,10 @@ const updateKey = (id, updates = {}) => {
     fields.push('allowed_team_ids = ?');
     params.push(arr ? JSON.stringify(arr) : null);
   }
+  if (updates.dailyQuota !== undefined) {
+    fields.push('daily_quota = ?');
+    params.push(updates.dailyQuota ? JSON.stringify(updates.dailyQuota) : null);
+  }
 
   if (!fields.length) return existing;
 
@@ -217,8 +235,8 @@ const ensureTestKey = () => {
   const existing = db.prepare('SELECT id FROM api_keys WHERE key_hash = ?').get(keyHash);
   if (existing) return;
   db.prepare(`
-    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, permissions, allowed_team_ids, is_active, grace_period_until, created_at)
-    VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, 1, NULL, ?)
+    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, permissions, allowed_team_ids, daily_quota, is_active, grace_period_until, created_at)
+    VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, NULL, 1, NULL, ?)
   `).run(
     'test-key-id',
     TEST_APP_ID,
@@ -234,6 +252,7 @@ module.exports = {
   generateApiKey,
   validateKey,
   getKeyById,
+  getRawKeyById,
   getKeysByAppId,
   revokeKey,
   updateKey,

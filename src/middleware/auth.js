@@ -1,5 +1,6 @@
-const { validateKey, ensureTestKey, TEST_APP_ID, TEST_API_KEY } = require('../repositories/apiKeyRepository');
+const { validateKey, ensureTestKey, TEST_APP_ID, TEST_API_KEY, getRawKeyById } = require('../repositories/apiKeyRepository');
 const { createAuditLog } = require('../repositories/auditLogRepository');
+const { recordUsage, checkQuota, ACTION_TYPES } = require('../repositories/usageRepository');
 
 const TEST_KEY_INFO = {
   id: 'test-key-id',
@@ -11,8 +12,26 @@ const TEST_KEY_INFO = {
   allowedTeamIds: null
 };
 
+const mapPathToAction = (method, path) => {
+  if (path === '/health') return null;
+  if (path.startsWith('/api-keys')) return null;
+
+  if (path === '/tasks/batch' && method === 'POST') return 'task.batch_query';
+  if (path === '/tasks' && method === 'POST') return 'task.submit';
+  if (path === '/tasks' && method === 'GET') return 'task.query';
+  if (path.match(/^\/tasks\/[^/]+$/) && method === 'GET') return 'task.query';
+  if (path.match(/^\/tasks\/[^/]+\/callbacks$/) && method === 'GET') return 'task.query';
+  if (path.match(/^\/tasks\/[^/]+\/callbacks\/retry$/) && method === 'POST') return 'callback.retry';
+  if (path.match(/^\/tasks\/[^/]+\/feedback$/) && method === 'POST') return 'feedback.submit';
+  if (path.startsWith('/teams') && method === 'GET') return 'task.query';
+  if (path.startsWith('/audit') && method === 'GET') return null;
+  if (path.startsWith('/usage') && method === 'GET') return null;
+  return null;
+};
+
 const authMiddleware = (req, res, next) => {
   let keyInfo = null;
+  let rawKeyRow = null;
 
   if (process.env.NODE_ENV === 'test') {
     ensureTestKey();
@@ -43,24 +62,68 @@ const authMiddleware = (req, res, next) => {
     }
   }
 
+  rawKeyRow = rawKeyRow || getRawKeyById(keyInfo.id);
+
+  const action = mapPathToAction(req.method, req.path);
+  if (process.env.NODE_ENV !== 'test' && action && ACTION_TYPES.includes(action) && rawKeyRow) {
+    const quotaCheck = checkQuota(rawKeyRow, action);
+    if (!quotaCheck.allowed) {
+      return res.status(429).json({
+        code: 'QUOTA_EXCEEDED',
+        message: `今日 '${action}' 配额已用完（${quotaCheck.used}/${quotaCheck.limit}）`,
+        data: {
+          action,
+          limit: quotaCheck.limit,
+          used: quotaCheck.used,
+          remaining: quotaCheck.remaining,
+          resetAt: quotaCheck.resetAt
+        }
+      });
+    }
+    req.quotaInfo = quotaCheck;
+  }
+
   req.apiKeyId = keyInfo.id;
   req.appId = keyInfo.appId;
   req.keyInfo = keyInfo;
   req.permissions = keyInfo.permissions;
   req.allowedTeamIds = keyInfo.allowedTeamIds;
 
-  req.audit = (action, taskId, detail) => {
+  req.audit = (a, taskId, detail) => {
     createAuditLog({
       appId: keyInfo.appId,
       keyId: keyInfo.id,
       keyPrefix: keyInfo.keyPrefix,
       appName: keyInfo.appName,
-      action,
+      action: a,
       taskId: taskId || null,
       detail: detail || null,
       ipAddress: req.ip || null
     });
   };
+
+  req.recordUsage = (a, teamId) => {
+    if (!a || !ACTION_TYPES.includes(a)) return;
+    recordUsage({
+      appId: keyInfo.appId,
+      keyId: keyInfo.id,
+      teamId: teamId || null,
+      action: a
+    });
+  };
+
+  res.on('finish', () => {
+    if (process.env.NODE_ENV === 'test') return;
+    if (res.statusCode >= 200 && res.statusCode < 300 && action) {
+      const tid = res.locals && res.locals.taskIdForUsage;
+      recordUsage({
+        appId: keyInfo.appId,
+        keyId: keyInfo.id,
+        teamId: tid ? null : (req.body && req.body.teamId ? req.body.teamId : null),
+        action
+      });
+    }
+  });
 
   next();
 };
@@ -105,5 +168,6 @@ module.exports = {
   requirePermission,
   checkTeamAllowed,
   isTeamAllowed,
+  mapPathToAction,
   default: authMiddleware
 };

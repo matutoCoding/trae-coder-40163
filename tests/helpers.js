@@ -2,6 +2,7 @@ const resetTestDb = () => {
   const db = require('../src/db');
   db.pragma('foreign_keys = OFF');
   db.exec(`
+    DROP TABLE IF EXISTS quota_daily;
     DROP TABLE IF EXISTS audit_logs;
     DROP TABLE IF EXISTS callback_logs;
     DROP TABLE IF EXISTS feedback;
@@ -22,6 +23,7 @@ const resetTestDb = () => {
     '../src/repositories/feedbackRepository',
     '../src/repositories/apiKeyRepository',
     '../src/repositories/callbackRepository',
+    '../src/repositories/usageRepository',
     '../src/repositories/auditLogRepository',
     '../src/services/taskService',
     '../src/middleware/auth',

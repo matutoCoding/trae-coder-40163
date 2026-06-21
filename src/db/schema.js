@@ -11,6 +11,7 @@ const initDatabase = () => {
       team_id TEXT,
       permissions TEXT NOT NULL DEFAULT '["admin"]',
       allowed_team_ids TEXT,
+      daily_quota TEXT,
       is_active INTEGER NOT NULL DEFAULT 1,
       grace_period_until INTEGER,
       created_at INTEGER NOT NULL,
@@ -30,6 +31,7 @@ const initDatabase = () => {
       backup_callback_url TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
       started_at INTEGER,
       completed_at INTEGER,
       error_message TEXT,
@@ -43,6 +45,7 @@ const initDatabase = () => {
     CREATE INDEX IF NOT EXISTS idx_tasks_team_id ON tasks(team_id);
     CREATE INDEX IF NOT EXISTS idx_tasks_app_id ON tasks(app_id);
     CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
+    CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
 
     CREATE TABLE IF NOT EXISTS callback_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +124,20 @@ const initDatabase = () => {
 
     CREATE INDEX IF NOT EXISTS idx_feedback_task_id ON feedback(task_id);
     CREATE INDEX IF NOT EXISTS idx_feedback_team_type ON feedback(team_id, feedback_type);
+
+    CREATE TABLE IF NOT EXISTS quota_daily (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      app_id TEXT NOT NULL,
+      key_id TEXT NOT NULL,
+      team_id TEXT,
+      date TEXT NOT NULL,
+      action TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_unique ON quota_daily(app_id, key_id, team_id, date, action);
+    CREATE INDEX IF NOT EXISTS idx_quota_app_date ON quota_daily(app_id, date);
+    CREATE INDEX IF NOT EXISTS idx_quota_key_date ON quota_daily(key_id, date);
   `);
 };
 

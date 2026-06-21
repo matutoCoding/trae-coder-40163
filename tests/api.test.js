@@ -792,6 +792,281 @@ describe('审计日志 GET /api/audit/logs', () => {
   });
 });
 
+describe('用量统计和配额控制', () => {
+  test('GET /api/usage/stats 返回用量统计，按密钥分组，不泄露完整密钥', async () => {
+    const { recordUsage, getTodayStr } = require('../src/repositories/usageRepository');
+    const { ensureTestKey, TEST_APP_ID } = require('../src/repositories/apiKeyRepository');
+    require('../src/db');
+    require('../src/db/schema')();
+    ensureTestKey();
+
+    recordUsage({ appId: TEST_APP_ID, keyId: 'test-key-id', teamId: 'team-usa', action: 'task.submit' });
+    recordUsage({ appId: TEST_APP_ID, keyId: 'test-key-id', teamId: 'team-usa', action: 'task.submit' });
+    recordUsage({ appId: TEST_APP_ID, keyId: 'test-key-id', teamId: 'team-usa', action: 'task.query' });
+
+    const app = createTestApp();
+    const res = await request(app).get('/api/usage/stats');
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data.totals['task.submit']).toBeGreaterThanOrEqual(2);
+    expect(Array.isArray(res.body.data.perKey)).toBe(true);
+    for (const k of res.body.data.perKey) {
+      expect(k.keyPrefix).toBeTruthy();
+      expect(k.apiKey).toBeUndefined();
+    }
+  });
+
+  test('超过日配额返回 429 QUOTA_EXCEEDED，含明确限制信息', async () => {
+    const origEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const { ensureTestKey, TEST_API_KEY, generateApiKey } = require('../src/repositories/apiKeyRepository');
+      require('../src/db');
+      require('../src/db/schema')();
+      ensureTestKey();
+
+      const limitedKey = generateApiKey('限额测试', null, {
+        appId: TEST_APP_ID,
+        permissions: ['tasks:read', 'tasks:write'],
+        dailyQuota: { 'task.submit': 2 }
+      });
+      const appProd = require('../src/app')();
+
+      const r1 = await request(appProd)
+        .post('/api/tasks')
+        .set('Authorization', `Bearer ${limitedKey.apiKey}`)
+        .send({ audioUrl: 'https://x.com/q1.mp3', meetingName: '限额1' });
+      const r2 = await request(appProd)
+        .post('/api/tasks')
+        .set('Authorization', `Bearer ${limitedKey.apiKey}`)
+        .send({ audioUrl: 'https://x.com/q2.mp3', meetingName: '限额2' });
+      expect(r1.statusCode).toBe(201);
+      expect(r2.statusCode).toBe(201);
+
+      const r3 = await request(appProd)
+        .post('/api/tasks')
+        .set('Authorization', `Bearer ${limitedKey.apiKey}`)
+        .send({ audioUrl: 'https://x.com/q3.mp3', meetingName: '限额3' });
+      expect(r3.statusCode).toBe(429);
+      expect(r3.body.code).toBe('QUOTA_EXCEEDED');
+      expect(r3.body.data.limit).toBe(2);
+      expect(r3.body.data.used).toBe(2);
+      expect(r3.body.data.resetAt).toBeGreaterThan(Date.now());
+    } finally {
+      process.env.NODE_ENV = origEnv;
+    }
+  });
+
+  test('API Key 创建和更新支持 dailyQuota 字段', async () => {
+    const app = createTestApp();
+    const create = await request(app)
+      .post('/api/api-keys')
+      .send({
+        appName: '配额Key',
+        permissions: ['tasks:read', 'tasks:write'],
+        dailyQuota: { 'task.submit': 100, 'task.query': 1000 }
+      });
+    expect(create.statusCode).toBe(201);
+    expect(create.body.data.dailyQuota).toEqual({ 'task.submit': 100, 'task.query': 1000 });
+    expect(create.body.data.apiKey).toMatch(/^vts_/);
+
+    const list = await request(app).get('/api/api-keys');
+    const key = list.body.data.keys.find((k) => k.appName === '配额Key');
+    expect(key).toBeTruthy();
+    expect(key.dailyQuota).toEqual({ 'task.submit': 100, 'task.query': 1000 });
+    expect(key.apiKey).toBeUndefined();
+
+    const update = await request(app)
+      .put(`/api/api-keys/${key.id}`)
+      .send({ dailyQuota: { 'task.submit': 500 } });
+    expect(update.statusCode).toBe(200);
+    expect(update.body.data.dailyQuota).toEqual({ 'task.submit': 500 });
+  });
+});
+
+describe('游标分页和增量拉取', () => {
+  test('列表接口返回 nextCursor 和 hasMore，游标分页不重复不漏', async () => {
+    const app = createTestApp();
+    for (let i = 0; i < 8; i++) {
+      await request(app)
+        .post('/api/tasks')
+        .send({ audioUrl: `https://x.com/cur${i}.mp3`, meetingName: `游标${i}`, teamId: 'team-cursor' });
+      await sleep(50);
+    }
+
+    const page1 = await request(app).get('/api/tasks?limit=3&teamId=team-cursor');
+    expect(page1.statusCode).toBe(200);
+    expect(page1.body.data.pagination.nextCursor).toBeTruthy();
+    expect(page1.body.data.pagination.hasMore).toBe(true);
+    expect(page1.body.data.tasks.length).toBe(3);
+
+    const page2 = await request(app).get(`/api/tasks?limit=3&teamId=team-cursor&cursor=${page1.body.data.pagination.nextCursor}`);
+    expect(page2.statusCode).toBe(200);
+    expect(page2.body.data.pagination.nextCursor).toBeTruthy();
+    expect(page2.body.data.tasks.length).toBe(3);
+    for (const t of page2.body.data.tasks) {
+      const ids = page1.body.data.tasks.map((x) => x.taskId);
+      expect(ids).not.toContain(t.taskId);
+    }
+
+    const page3 = await request(app).get(`/api/tasks?limit=3&teamId=team-cursor&cursor=${page2.body.data.pagination.nextCursor}`);
+    expect(page3.statusCode).toBe(200);
+    expect(page3.body.data.tasks.length).toBe(2);
+    expect(page3.body.data.pagination.hasMore).toBe(false);
+    expect(page3.body.data.pagination.nextCursor).toBeNull();
+
+    const allIds = [
+      ...page1.body.data.tasks.map((t) => t.taskId),
+      ...page2.body.data.tasks.map((t) => t.taskId),
+      ...page3.body.data.tasks.map((t) => t.taskId)
+    ];
+    expect(new Set(allIds).size).toBe(8);
+  });
+
+  test('updatedSince 增量拉取只返回更新时间之后的任务', async () => {
+    const app = createTestApp();
+    const now = Date.now();
+    await submitAndWait(app, { audioUrl: 'https://x.com/inc1.mp3', meetingName: '增量1', teamId: 'team-inc' });
+    await submitAndWait(app, { audioUrl: 'https://x.com/inc2.mp3', meetingName: '增量2', teamId: 'team-inc' });
+    await sleep(100);
+    const t1 = Date.now();
+    await submitAndWait(app, { audioUrl: 'https://x.com/inc3.mp3', meetingName: '增量3', teamId: 'team-inc' });
+
+    const res = await request(app).get(`/api/tasks?teamId=team-inc&updatedSince=${t1}`);
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data.tasks.length).toBeGreaterThanOrEqual(1);
+    for (const t of res.body.data.tasks) {
+      expect(t.updatedAt).toBeGreaterThanOrEqual(t1);
+    }
+  });
+
+  test('每个任务条目返回 updatedAt 字段', async () => {
+    const app = createTestApp();
+    await submitAndWait(app, { audioUrl: 'https://x.com/ua.mp3', meetingName: '更新时间', teamId: 'team-ua' });
+    const res = await request(app).get('/api/tasks?teamId=team-ua');
+    expect(res.statusCode).toBe(200);
+    expect(res.body.data.tasks[0].updatedAt).toBeGreaterThan(0);
+    expect(res.body.data.tasks[0].createdAt).toBeGreaterThan(0);
+  });
+});
+
+describe('回调超时 & 重放成功清状态', () => {
+  test('回调失败原因支持 timeout 分类，重放成功后 failureReason 清空', async () => {
+    const app = createTestApp();
+    const taskId = await submitAndWait(app, {
+      audioUrl: 'https://x.com/cleared.mp3',
+      meetingName: '清除失败原因',
+      teamId: 'team-clr',
+      callbackUrl: 'https://cb.example.com/hook'
+    });
+
+    const taskRepo = require('../src/repositories/taskRepository');
+    taskRepo.updateTaskStatus(taskId, 'completed', {
+      callbackStatus: 'failed',
+      callbackAttempts: 2,
+      callbackFailureReason: 'timeout',
+      lastCallbackAt: Date.now()
+    });
+
+    const before = await request(app).get(`/api/tasks/${taskId}`);
+    expect(before.body.data.callback.status).toBe('failed');
+    expect(before.body.data.callback.failureReason).toBe('timeout');
+    expect(before.body.data.callback.attempts).toBe(2);
+
+    const cbRepo = require('../src/repositories/callbackRepository');
+    cbRepo.createCallbackLog({
+      taskId,
+      url: 'https://cb.example.com/hook',
+      statusCode: null,
+      failureReason: 'timeout',
+      attempt: 2,
+      createdAt: Date.now() - 60000
+    });
+
+    const retry = await request(app).post(`/api/tasks/${taskId}/callbacks/retry`);
+    expect(retry.statusCode).toBe(202);
+
+    await sleep(200);
+
+    const after = await request(app).get(`/api/tasks/${taskId}`);
+    expect(after.body.data.callback.status).toBe('delivered');
+    expect(after.body.data.callback.failureReason).toBeNull();
+    expect(after.body.data.callback.attempts).toBe(3);
+    expect(after.body.data.callback.recentLogs[0].failureReason).toBeNull();
+  });
+});
+
+describe('反馈团队兜底 & 批量审计拆分', () => {
+  test('反馈不传 teamId 时用 task.teamId 兜底校验，受限密钥无法绕过', async () => {
+    const origEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const { ensureTestKey, generateApiKey, TEST_APP_ID, TEST_API_KEY } = require('../src/repositories/apiKeyRepository');
+      require('../src/db');
+      require('../src/db/schema')();
+      ensureTestKey();
+
+      const appProd = require('../src/app')();
+
+      const submit = await request(appProd)
+        .post('/api/tasks')
+        .set('Authorization', `Bearer ${TEST_API_KEY}`)
+        .send({ audioUrl: 'https://x.com/fbk.mp3', meetingName: '兜底测试', teamId: 'team-fb' });
+      const taskId = submit.body.data.taskId;
+      await sleep(800);
+
+      const limitedKey = generateApiKey('受限反馈', null, {
+        appId: TEST_APP_ID,
+        permissions: ['tasks:read', 'feedback:write'],
+        allowedTeamIds: ['team-other']
+      });
+
+      const res = await request(appProd)
+        .post(`/api/tasks/${taskId}/feedback`)
+        .set('Authorization', `Bearer ${limitedKey.apiKey}`)
+        .send({ corrections: [{ type: 'speaker_rename', segmentId: 1, newSpeakerLabel: 'X', scope: 'segment' }] });
+      expect(res.statusCode).toBe(403);
+      expect(res.body.code).toBe('TEAM_NOT_ALLOWED');
+    } finally {
+      process.env.NODE_ENV = origEnv;
+    }
+  });
+
+  test('批量查询成功的每个任务产生独立的 task.query 审计记录', async () => {
+    const app = createTestApp();
+    const t1 = await submitAndWait(app, { audioUrl: 'https://x.com/ab1.mp3', meetingName: '审计A', teamId: 'team-ab' });
+    const t2 = await submitAndWait(app, { audioUrl: 'https://x.com/ab2.mp3', meetingName: '审计B', teamId: 'team-ab' });
+
+    const before = await request(app).get('/api/audit/logs?action=task.query');
+    const countBefore = before.body.data.logs.length;
+
+    await request(app).post('/api/tasks/batch').send({ taskIds: [t1, t2, 'not-existing'] });
+
+    const after = await request(app).get('/api/audit/logs?action=task.query');
+    const countAfter = after.body.data.logs.length;
+    expect(countAfter - countBefore).toBe(2);
+
+    const taskIds = after.body.data.logs.slice(0, 2).map((l) => l.taskId);
+    expect(taskIds).toContain(t1);
+    expect(taskIds).toContain(t2);
+
+    const detailLogs = after.body.data.logs.filter((l) => l.detail === 'via_batch');
+    expect(detailLogs.length).toBe(2);
+  });
+
+  test('按 taskId 查询审计日志，能看到该任务被批量拉取过', async () => {
+    const app = createTestApp();
+    const t1 = await submitAndWait(app, { audioUrl: 'https://x.com/ab3.mp3', meetingName: '审计C', teamId: 'team-ab2' });
+    await request(app).post('/api/tasks/batch').send({ taskIds: [t1] });
+
+    const res = await request(app).get(`/api/audit/logs?taskId=${t1}`);
+    expect(res.statusCode).toBe(200);
+    const actions = res.body.data.logs.map((l) => l.action);
+    expect(actions).toContain('task.query');
+    const hasViaBatch = res.body.data.logs.some((l) => l.detail === 'via_batch');
+    expect(hasViaBatch).toBe(true);
+  });
+});
+
 describe('错误路由和全局异常', () => {
   test('访问不存在的路由返回 404', async () => {
     const app = createTestApp();

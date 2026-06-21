@@ -162,6 +162,7 @@ class TaskService {
           port: u.port,
           path: u.pathname + u.search,
           method: 'POST',
+          timeout: 10000,
           headers: {
             'Content-Type': 'application/json',
             'Content-Length': Buffer.byteLength(body),
@@ -173,7 +174,17 @@ class TaskService {
           res.on('data', (chunk) => { data += chunk; });
           res.on('end', () => cb(null, res.statusCode, data));
         });
-        req.on('error', (err) => cb(err));
+        let done = false;
+        req.on('error', (err) => {
+          if (done) return;
+          done = true;
+          cb(err);
+        });
+        req.on('timeout', () => {
+          if (done) return;
+          done = true;
+          req.destroy(new Error('ETIMEDOUT'));
+        });
         req.write(body);
         req.end();
       } catch (e) {
@@ -186,7 +197,11 @@ class TaskService {
       const cbStatus = success ? 'delivered' : 'failed';
       let failureReason = null;
       if (err) {
-        failureReason = 'network_error';
+        if (err.message === 'ETIMEDOUT' || err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET') {
+          failureReason = 'timeout';
+        } else {
+          failureReason = 'network_error';
+        }
       } else if (statusCode < 200 || statusCode >= 300) {
         failureReason = 'non_2xx';
       }
@@ -295,7 +310,16 @@ class TaskService {
     if (!appId) {
       return { error: { code: 'MISSING_APP_ID', message: '缺少应用标识' }, httpStatus: 400 };
     }
-    return queryTasks({ appId, ...filters });
+    return queryTasks({
+      appId,
+      teamId: filters.teamId || null,
+      allowedTeamIds: filters.allowedTeamIds || null,
+      status: filters.status || null,
+      since: filters.since || null,
+      updatedSince: filters.updatedSince || null,
+      limit: filters.limit || 20,
+      cursor: filters.cursor || null
+    });
   }
 
   _calcProgress(task) {

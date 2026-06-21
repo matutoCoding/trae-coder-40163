@@ -8,9 +8,10 @@ const TaskStatus = {
 };
 
 const createTask = ({ id, appId, audioUrl, meetingName, teamId, callbackUrl, backupCallbackUrl, createdAt }) => {
+  const now = createdAt || Date.now();
   const stmt = db.prepare(`
-    INSERT INTO tasks (id, app_id, audio_url, meeting_name, team_id, callback_url, backup_callback_url, status, created_at)
-    VALUES (@id, @appId, @audioUrl, @meetingName, @teamId, @callbackUrl, @backupCallbackUrl, @status, @createdAt)
+    INSERT INTO tasks (id, app_id, audio_url, meeting_name, team_id, callback_url, backup_callback_url, status, created_at, updated_at)
+    VALUES (@id, @appId, @audioUrl, @meetingName, @teamId, @callbackUrl, @backupCallbackUrl, @status, @createdAt, @updatedAt)
   `);
   stmt.run({
     id,
@@ -21,7 +22,8 @@ const createTask = ({ id, appId, audioUrl, meetingName, teamId, callbackUrl, bac
     callbackUrl: callbackUrl || null,
     backupCallbackUrl: backupCallbackUrl || null,
     status: TaskStatus.PENDING,
-    createdAt
+    createdAt: now,
+    updatedAt: now
   });
   return getTaskById(id);
 };
@@ -48,6 +50,7 @@ const mapRow = (row) => ({
   backupCallbackUrl: row.backup_callback_url,
   status: row.status,
   createdAt: row.created_at,
+  updatedAt: row.updated_at,
   startedAt: row.started_at,
   completedAt: row.completed_at,
   errorMessage: row.error_message,
@@ -58,8 +61,8 @@ const mapRow = (row) => ({
 });
 
 const updateTaskStatus = (id, status, extra = {}) => {
-  const fields = ['status = ?'];
-  const params = [status];
+  const fields = ['status = ?', 'updated_at = ?'];
+  const params = [status, Date.now()];
 
   if (extra.startedAt !== undefined) {
     fields.push('started_at = ?');
@@ -96,7 +99,7 @@ const updateTaskStatus = (id, status, extra = {}) => {
   return result.changes > 0;
 };
 
-const queryTasks = ({ appId, teamId, allowedTeamIds, status, startTime, endTime, limit = 20, offset = 0 }) => {
+const queryTasks = ({ appId, teamId, allowedTeamIds, status, since, updatedSince, limit = 20, cursor = null }) => {
   const conditions = ['t.app_id = ?'];
   const params = [appId];
 
@@ -112,13 +115,20 @@ const queryTasks = ({ appId, teamId, allowedTeamIds, status, startTime, endTime,
     conditions.push('t.status = ?');
     params.push(status);
   }
-  if (startTime) {
+  if (since) {
     conditions.push('t.created_at >= ?');
-    params.push(startTime);
+    params.push(since);
   }
-  if (endTime) {
-    conditions.push('t.created_at <= ?');
-    params.push(endTime);
+  if (updatedSince) {
+    conditions.push('t.updated_at >= ?');
+    params.push(updatedSince);
+  }
+  if (cursor) {
+    const [cursorTs, cursorId] = decodeCursor(cursor);
+    if (cursorTs && cursorId) {
+      conditions.push('(t.updated_at < ? OR (t.updated_at = ? AND t.id < ?))');
+      params.push(cursorTs, cursorTs, cursorId);
+    }
   }
 
   const where = conditions.join(' AND ');
@@ -131,16 +141,44 @@ const queryTasks = ({ appId, teamId, allowedTeamIds, status, startTime, endTime,
       (SELECT COUNT(*) FROM segments s WHERE s.task_id = t.id) as segment_count
     FROM tasks t
     WHERE ${where}
-    ORDER BY t.created_at DESC
-    LIMIT ? OFFSET ?
-  `).all(...params, limit, offset);
+    ORDER BY t.updated_at DESC, t.id DESC
+    LIMIT ?
+  `).all(...params, limit + 1);
 
-  const tasks = rows.map((r) => ({
+  const hasMore = rows.length > limit;
+  const resultRows = hasMore ? rows.slice(0, limit) : rows;
+
+  const tasks = resultRows.map((r) => ({
     ...mapRow(r),
     segmentCount: r.segment_count
   }));
 
-  return { tasks, total, limit, offset };
+  let nextCursor = null;
+  if (hasMore && tasks.length > 0) {
+    const last = tasks[tasks.length - 1];
+    nextCursor = encodeCursor(last.updatedAt, last.id);
+  }
+
+  return { tasks, total, limit, nextCursor, hasMore };
+};
+
+const encodeCursor = (updatedAt, taskId) => {
+  return Buffer.from(`${updatedAt}_${taskId}`, 'utf8').toString('base64');
+};
+
+const decodeCursor = (cursor) => {
+  try {
+    const decoded = Buffer.from(cursor, 'base64').toString('utf8');
+    const parts = decoded.split('_');
+    if (parts.length >= 2) {
+      const ts = parseInt(parts[0], 10);
+      const id = parts.slice(1).join('_');
+      return [ts, id];
+    }
+    return [null, null];
+  } catch (_) {
+    return [null, null];
+  }
 };
 
 const getTasksByTeamId = (teamId, appId, limit = 20, offset = 0) => {
@@ -154,5 +192,7 @@ module.exports = {
   getTaskByIdAndAppId,
   updateTaskStatus,
   queryTasks,
-  getTasksByTeamId
+  getTasksByTeamId,
+  encodeCursor,
+  decodeCursor
 };
