@@ -1,9 +1,12 @@
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const {
   TaskStatus,
   createTask,
   getTaskById,
-  updateTaskStatus
+  getTaskByIdAndAppId,
+  updateTaskStatus,
+  queryTasks
 } = require('../repositories/taskRepository');
 const {
   createParticipants,
@@ -13,6 +16,7 @@ const {
 const {
   createSegments,
   getSegmentsByTaskId,
+  getSegmentById,
   updateSegmentSpeaker,
   mergeSegments,
   updateSegmentText
@@ -21,20 +25,32 @@ const {
   FeedbackType,
   createFeedback,
   getFeedbackByTaskId,
-  buildSpeakerRenamesByTeam
+  buildSpeakerRenamesByTeam,
+  getTeamLearningOverview
 } = require('../repositories/feedbackRepository');
+const { createCallbackLog, getCallbackLogsByTaskId } = require('../repositories/callbackRepository');
 const { simulateDiarization } = require('./transcriptionEngine');
 
+const CALLBACK_MAX_RETRIES = 3;
+const CALLBACK_RETRY_DELAYS = [5000, 30000, 120000];
 const now = () => Date.now();
 
+const generateSignature = (taskId, timestamp) => {
+  const secret = process.env.CALLBACK_SECRET || 'vts_default_secret';
+  return crypto.createHmac('sha256', secret)
+    .update(`${taskId}:${timestamp}`)
+    .digest('hex');
+};
+
 class TaskService {
-  submitTask(payload) {
+  submitTask(payload, appId) {
     const { audioUrl, meetingName, teamId, callbackUrl, participants = [] } = payload;
     const taskId = uuidv4();
     const createdAt = now();
 
     const task = createTask({
       id: taskId,
+      appId,
       audioUrl,
       meetingName,
       teamId,
@@ -44,8 +60,8 @@ class TaskService {
 
     if (participants && participants.length > 0) {
       const normalized = participants.map((p, idx) => ({
-        speakerLabel: p.speakerLabel || `发言人${idx + 1}`,
-        displayName: p.displayName || null
+        speakerLabel: (p && p.speakerLabel) || `发言人${idx + 1}`,
+        displayName: (p && p.displayName) || null
       }));
       createParticipants(taskId, normalized);
     }
@@ -88,7 +104,7 @@ class TaskService {
       updateTaskStatus(taskId, TaskStatus.COMPLETED, { completedAt: now() });
 
       if (task.callbackUrl) {
-        this._fireCallback(task.callbackUrl, taskId);
+        this._fireCallbackWithRetry(task.callbackUrl, taskId);
       }
     } catch (err) {
       updateTaskStatus(taskId, TaskStatus.FAILED, {
@@ -99,39 +115,128 @@ class TaskService {
     }
   }
 
-  _fireCallback(url, taskId) {
-    if (process.env.NODE_ENV === 'test') return;
+  _fireCallbackWithRetry(url, taskId, attempt = 1) {
+    const ts = now();
+    const sig = generateSignature(taskId, ts);
+    const resultUrl = `/api/tasks/${taskId}`;
+    const payload = JSON.stringify({
+      taskId,
+      status: 'completed',
+      event: 'task_finished',
+      timestamp: ts,
+      signature: sig,
+      resultUrl,
+      _links: {
+        result: {
+          method: 'GET',
+          href: resultUrl,
+          signature: sig,
+          timestamp: ts
+        }
+      }
+    });
+
+    if (process.env.NODE_ENV === 'test') {
+      updateTaskStatus(taskId, TaskStatus.COMPLETED, {
+        callbackStatus: 'delivered',
+        callbackAttempts: attempt,
+        lastCallbackAt: ts
+      });
+      createCallbackLog({
+        taskId, url, payload, statusCode: 200, attempt, createdAt: ts, nextRetryAt: null
+      });
+      return;
+    }
+
     const http = require('http');
     const https = require('https');
-    const client = url.startsWith('https') ? https : http;
-    const body = JSON.stringify({ taskId, status: 'completed', event: 'task_finished' });
-    try {
-      const u = new URL(url);
-      const req = client.request({
-        hostname: u.hostname,
-        port: u.port,
-        path: u.pathname + u.search,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+
+    const doRequest = (callbackUrl, body, cb) => {
+      const client = callbackUrl.startsWith('https') ? https : http;
+      try {
+        const u = new URL(callbackUrl);
+        const req = client.request({
+          hostname: u.hostname,
+          port: u.port,
+          path: u.pathname + u.search,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+            'X-VTS-Signature': sig,
+            'X-VTS-Timestamp': String(ts)
+          }
+        }, (res) => {
+          let data = '';
+          res.on('data', (chunk) => { data += chunk; });
+          res.on('end', () => cb(null, res.statusCode, data));
+        });
+        req.on('error', (err) => cb(err));
+        req.write(body);
+        req.end();
+      } catch (e) {
+        cb(e);
+      }
+    };
+
+    doRequest(url, payload, (err, statusCode, responseBody) => {
+      const success = !err && statusCode >= 200 && statusCode < 300;
+      const cbStatus = success ? 'delivered' : 'failed';
+      updateTaskStatus(taskId, TaskStatus.COMPLETED, {
+        callbackStatus: cbStatus,
+        callbackAttempts: attempt,
+        lastCallbackAt: ts
       });
-      req.on('error', () => {});
-      req.write(body);
-      req.end();
-    } catch (_) { /* ignore */ }
+      createCallbackLog({
+        taskId, url, payload,
+        statusCode: statusCode || null,
+        responseBody: responseBody || (err ? err.message : null),
+        attempt,
+        createdAt: ts,
+        nextRetryAt: success ? null : this._nextRetryAt(attempt)
+      });
+
+      if (!success && attempt < CALLBACK_MAX_RETRIES) {
+        const delay = CALLBACK_RETRY_DELAYS[attempt - 1] || 120000;
+        setTimeout(() => {
+          this._fireCallbackWithRetry(url, taskId, attempt + 1);
+        }, delay);
+      }
+    });
   }
 
-  getTaskResult(taskId) {
-    const task = getTaskById(taskId);
+  _nextRetryAt(attempt) {
+    const delay = CALLBACK_RETRY_DELAYS[attempt - 1] || 120000;
+    return now() + delay;
+  }
+
+  getTaskResult(taskId, appId) {
+    const task = appId
+      ? getTaskByIdAndAppId(taskId, appId)
+      : getTaskById(taskId);
     if (!task) {
-      return { error: { code: 'TASK_NOT_FOUND', message: '任务不存在' }, httpStatus: 404 };
+      return { error: { code: 'TASK_NOT_FOUND', message: '任务不存在或无权访问' }, httpStatus: 404 };
     }
 
     const participants = getParticipantsByTaskId(taskId);
     const segments = getSegmentsByTaskId(taskId);
     const feedback = getFeedbackByTaskId(taskId);
+    const callbackLogs = getCallbackLogsByTaskId(taskId);
 
     const bySpeaker = this._groupBySpeaker(segments);
     const speakers = this._buildSpeakers(bySpeaker, participants);
+
+    const callbackInfo = task.callbackUrl ? {
+      url: task.callbackUrl,
+      status: task.callbackStatus,
+      attempts: task.callbackAttempts || 0,
+      lastCallbackAt: task.lastCallbackAt,
+      recentLogs: callbackLogs.slice(0, 3).map((l) => ({
+        attempt: l.attempt,
+        statusCode: l.statusCode,
+        createdAt: l.createdAt
+      }))
+    } : null;
 
     return {
       data: {
@@ -146,6 +251,7 @@ class TaskService {
         },
         progress: this._calcProgress(task),
         errorMessage: task.errorMessage,
+        callback: callbackInfo,
         participants: participants.map((p) => ({
           speakerLabel: p.speakerLabel,
           displayName: p.displayName
@@ -163,6 +269,13 @@ class TaskService {
         }))
       }
     };
+  }
+
+  listTasks(appId, filters = {}) {
+    if (!appId) {
+      return { error: { code: 'MISSING_APP_ID', message: '缺少应用标识' }, httpStatus: 400 };
+    }
+    return queryTasks({ appId, ...filters });
   }
 
   _calcProgress(task) {
@@ -216,10 +329,12 @@ class TaskService {
     };
   }
 
-  submitFeedback(taskId, payload) {
-    const task = getTaskById(taskId);
+  submitFeedback(taskId, payload, appId) {
+    const task = appId
+      ? getTaskByIdAndAppId(taskId, appId)
+      : getTaskById(taskId);
     if (!task) {
-      return { error: { code: 'TASK_NOT_FOUND', message: '任务不存在' }, httpStatus: 404 };
+      return { error: { code: 'TASK_NOT_FOUND', message: '任务不存在或无权访问' }, httpStatus: 404 };
     }
 
     const { corrections = [], teamId } = payload;
@@ -227,12 +342,20 @@ class TaskService {
       return { error: { code: 'EMPTY_CORRECTIONS', message: '未提供任何修正信息' }, httpStatus: 400 };
     }
 
+    const taskSegments = getSegmentsByTaskId(taskId);
+    const segmentIdSet = new Set(taskSegments.map((s) => s.id));
+
     const validated = [];
     const errors = [];
     const ts = now();
 
     for (let i = 0; i < corrections.length; i++) {
       const c = corrections[i];
+      const ownershipError = this._checkSegmentOwnership(c, segmentIdSet);
+      if (ownershipError) {
+        errors.push({ index: i, ...ownershipError });
+        continue;
+      }
       const check = this._applyCorrection(taskId, c, ts);
       if (check.error) {
         errors.push({ index: i, ...check.error });
@@ -264,6 +387,31 @@ class TaskService {
         }))
       }
     };
+  }
+
+  _checkSegmentOwnership(correction, segmentIdSet) {
+    const { type, segmentId, segmentIds } = correction;
+
+    if (type === 'speaker_rename' && correction.scope === 'segment' && segmentId) {
+      if (!segmentIdSet.has(segmentId)) {
+        return { code: 'SEGMENT_NOT_BELONG', message: `片段 ${segmentId} 不属于当前任务` };
+      }
+    }
+
+    if (type === 'segment_merge' && Array.isArray(segmentIds)) {
+      const foreign = segmentIds.filter((id) => !segmentIdSet.has(id));
+      if (foreign.length > 0) {
+        return { code: 'SEGMENT_NOT_BELONG', message: `片段 ${foreign.join(',')} 不属于当前任务` };
+      }
+    }
+
+    if (type === 'text_correction' && segmentId) {
+      if (!segmentIdSet.has(segmentId)) {
+        return { code: 'SEGMENT_NOT_BELONG', message: `片段 ${segmentId} 不属于当前任务` };
+      }
+    }
+
+    return null;
   }
 
   _applyCorrection(taskId, correction, ts) {
@@ -364,6 +512,10 @@ class TaskService {
     correction.segmentId = segmentId;
     correction.metadata = { changed: oldText !== newText };
     return {};
+  }
+
+  getTeamLearning(teamId, appId) {
+    return getTeamLearningOverview(teamId, appId);
   }
 }
 

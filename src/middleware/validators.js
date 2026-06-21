@@ -21,8 +21,18 @@ const validateSubmitTask = (req, res, next) => {
       errors.push({ field: 'participants', message: '参会人数量不能超过 100' });
     } else {
       req.body.participants.forEach((p, i) => {
-        if (p && p.displayName && p.displayName.length > 100) {
-          errors.push({ field: `participants[${i}].displayName`, message: '姓名长度不能超过 100' });
+        if (p === null || p === undefined || typeof p !== 'object') {
+          errors.push({ field: `participants[${i}]`, message: '参会人条目不能为空值，必须为包含 speakerLabel 和/或 displayName 的对象' });
+        } else {
+          if (p.speakerLabel !== undefined && p.speakerLabel !== null && (typeof p.speakerLabel !== 'string' || p.speakerLabel.trim().length === 0)) {
+            errors.push({ field: `participants[${i}].speakerLabel`, message: 'speakerLabel 必须为非空字符串' });
+          }
+          if (p.displayName !== undefined && p.displayName !== null && typeof p.displayName !== 'string') {
+            errors.push({ field: `participants[${i}].displayName`, message: 'displayName 必须为字符串' });
+          }
+          if (p.displayName && p.displayName.length > 100) {
+            errors.push({ field: `participants[${i}].displayName`, message: '姓名长度不能超过 100' });
+          }
         }
       });
     }

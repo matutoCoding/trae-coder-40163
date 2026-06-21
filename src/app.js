@@ -22,8 +22,10 @@ const createApp = () => {
       endpoints: {
         health: 'GET /api/health',
         submitTask: 'POST /api/tasks',
+        listTasks: 'GET /api/tasks',
         queryResult: 'GET /api/tasks/:taskId',
-        submitFeedback: 'POST /api/tasks/:taskId/feedback'
+        submitFeedback: 'POST /api/tasks/:taskId/feedback',
+        teamLearning: 'GET /api/teams/:teamId/learning'
       },
       version: '1.0.0'
     });

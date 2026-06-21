@@ -1,22 +1,33 @@
-const fs = require('fs');
-const path = require('path');
-
 const resetTestDb = () => {
-  const dbPath = path.join(__dirname, '..', '..', 'data', 'test.db');
-  const shmPath = dbPath + '-shm';
-  const walPath = dbPath + '-wal';
-  for (const p of [dbPath, shmPath, walPath]) {
-    if (fs.existsSync(p)) {
-      try { fs.unlinkSync(p); } catch (_) {}
-    }
+  const db = require('../src/db');
+  db.pragma('foreign_keys = OFF');
+  db.exec(`
+    DROP TABLE IF EXISTS callback_logs;
+    DROP TABLE IF EXISTS feedback;
+    DROP TABLE IF EXISTS segments;
+    DROP TABLE IF EXISTS participants;
+    DROP TABLE IF EXISTS tasks;
+    DROP TABLE IF EXISTS api_keys;
+  `);
+  db.pragma('foreign_keys = ON');
+
+  const initDatabase = require('../src/db/schema');
+  initDatabase();
+
+  const modules = [
+    '../src/repositories/taskRepository',
+    '../src/repositories/participantRepository',
+    '../src/repositories/segmentRepository',
+    '../src/repositories/feedbackRepository',
+    '../src/repositories/apiKeyRepository',
+    '../src/repositories/callbackRepository',
+    '../src/services/taskService',
+    '../src/middleware/auth',
+    '../src/app'
+  ];
+  for (const m of modules) {
+    try { delete require.cache[require.resolve(m)]; } catch (_) {}
   }
-  try { delete require.cache[require.resolve('../src/db')]; } catch (_) {}
-  try { delete require.cache[require.resolve('../src/repositories/taskRepository')]; } catch (_) {}
-  try { delete require.cache[require.resolve('../src/repositories/participantRepository')]; } catch (_) {}
-  try { delete require.cache[require.resolve('../src/repositories/segmentRepository')]; } catch (_) {}
-  try { delete require.cache[require.resolve('../src/repositories/feedbackRepository')]; } catch (_) {}
-  try { delete require.cache[require.resolve('../src/services/taskService')]; } catch (_) {}
-  try { delete require.cache[require.resolve('../src/app')]; } catch (_) {}
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

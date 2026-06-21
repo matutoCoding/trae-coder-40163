@@ -84,11 +84,71 @@ const buildSpeakerRenamesByTeam = (teamId) => {
   return map;
 };
 
+const getTeamLearningOverview = (teamId, appId) => {
+  if (!teamId) return null;
+
+  const appIdCondition = appId ? ' AND f.task_id IN (SELECT id FROM tasks WHERE app_id = ?)' : '';
+  const baseParams = appId ? [teamId, appId] : [teamId];
+
+  const typeStats = db.prepare(`
+    SELECT feedback_type, COUNT(*) as count
+    FROM feedback f
+    WHERE f.team_id = ?${appIdCondition}
+    GROUP BY feedback_type
+  `).all(...baseParams);
+
+  const statsByType = {};
+  let totalFeedback = 0;
+  for (const row of typeStats) {
+    statsByType[row.feedback_type] = row.count;
+    totalFeedback += row.count;
+  }
+
+  const renameRows = db.prepare(`
+    SELECT DISTINCT old_value, new_value
+    FROM feedback
+    WHERE team_id = ? AND feedback_type = ? AND old_value IS NOT NULL
+    ORDER BY created_at DESC LIMIT 50
+  `).all(teamId, FeedbackType.SPEAKER_RENAME);
+  const speakerMappings = renameRows.map((r) => ({
+    from: r.old_value,
+    to: r.new_value
+  }));
+
+  const recentFeedback = getFeedbackByTeamId(teamId, null, 10);
+
+  const taskCountRow = db.prepare(`
+    SELECT COUNT(DISTINCT f.task_id) as count
+    FROM feedback f
+    WHERE f.team_id = ?${appIdCondition}
+  `).get(...baseParams);
+
+  return {
+    teamId,
+    totalFeedback,
+    feedbackByType: statsByType,
+    speakerMappings,
+    totalMergeCount: statsByType[FeedbackType.SEGMENT_MERGE] || 0,
+    totalRenameCount: statsByType[FeedbackType.SPEAKER_RENAME] || 0,
+    totalTextCorrectionCount: statsByType[FeedbackType.TEXT_CORRECTION] || 0,
+    tasksWithFeedback: taskCountRow ? taskCountRow.count : 0,
+    recentFeedback: recentFeedback.map((f) => ({
+      id: f.id,
+      taskId: f.taskId,
+      feedbackType: f.feedbackType,
+      oldValue: f.oldValue,
+      newValue: f.newValue,
+      createdAt: f.createdAt
+    }))
+  };
+};
+
 module.exports = {
   FeedbackType,
   createFeedback,
   getFeedbackByTaskId,
   getFeedbackByTeamId,
   markFeedbackApplied,
-  buildSpeakerRenamesByTeam
+  buildSpeakerRenamesByTeam,
+  getTeamLearningOverview
 };
