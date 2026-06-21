@@ -38,6 +38,14 @@ const parseTeams = (row) => {
   }
 };
 
+const computeKeyStatus = (row) => {
+  if (row.is_active !== 1) {
+    if (row.grace_period_until && row.grace_period_until > Date.now()) return 'grace';
+    return 'revoked';
+  }
+  return 'effective';
+};
+
 const maskKeyRow = (row) => ({
   id: row.id,
   appId: row.app_id,
@@ -47,6 +55,8 @@ const maskKeyRow = (row) => ({
   permissions: parsePerms(row),
   allowedTeamIds: parseTeams(row),
   isActive: row.is_active === 1,
+  status: computeKeyStatus(row),
+  gracePeriodUntil: row.grace_period_until || null,
   createdAt: row.created_at,
   revokedAt: row.revoked_at
 });
@@ -60,10 +70,13 @@ const generateApiKey = (appName, teamId = null, options = {}) => {
   const createdAt = Date.now();
   const permissions = normalizePermissions(options.permissions);
   const allowedTeamIds = normalizeTeamIds(options.allowedTeamIds);
+  const gracePeriodUntil = options.gracePeriodMinutes
+    ? createdAt + options.gracePeriodMinutes * 60 * 1000
+    : null;
 
   const stmt = db.prepare(`
-    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, permissions, allowed_team_ids, is_active, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, permissions, allowed_team_ids, is_active, grace_period_until, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
   `);
   stmt.run(
     id,
@@ -74,6 +87,7 @@ const generateApiKey = (appName, teamId = null, options = {}) => {
     teamId || null,
     JSON.stringify(permissions),
     allowedTeamIds ? JSON.stringify(allowedTeamIds) : null,
+    gracePeriodUntil,
     createdAt
   );
 
@@ -86,6 +100,7 @@ const generateApiKey = (appName, teamId = null, options = {}) => {
     teamId: teamId || null,
     permissions,
     allowedTeamIds,
+    gracePeriodUntil,
     createdAt
   };
 };
@@ -98,10 +113,19 @@ const validateKey = (rawKey) => {
   if (!rawKey || typeof rawKey !== 'string') return null;
   const keyHash = hashKey(rawKey);
   const row = db.prepare(`
-    SELECT id, app_id, app_name, key_prefix, team_id, permissions, allowed_team_ids, is_active
-    FROM api_keys WHERE key_hash = ? AND is_active = 1
+    SELECT id, app_id, app_name, key_prefix, team_id, permissions, allowed_team_ids, is_active, grace_period_until
+    FROM api_keys WHERE key_hash = ?
   `).get(keyHash);
   if (!row) return null;
+
+  if (row.is_active !== 1) {
+    if (row.grace_period_until && row.grace_period_until > Date.now()) {
+      // grace period: still valid
+    } else {
+      return null;
+    }
+  }
+
   return {
     id: row.id,
     appId: row.app_id,
@@ -127,9 +151,34 @@ const getKeysByAppId = (appId) => {
 
 const revokeKey = (id) => {
   const result = db.prepare(`
-    UPDATE api_keys SET is_active = 0, revoked_at = ? WHERE id = ? AND is_active = 1
+    UPDATE api_keys SET is_active = 0, revoked_at = ?, grace_period_until = NULL WHERE id = ?
   `).run(Date.now(), id);
   return result.changes > 0;
+};
+
+const setKeyGracePeriod = (id, gracePeriodMinutes) => {
+  const until = Date.now() + gracePeriodMinutes * 60 * 1000;
+  db.prepare(`
+    UPDATE api_keys SET grace_period_until = ? WHERE id = ?
+  `).run(until, id);
+  return getKeyById(id);
+};
+
+const rotateKey = (oldKeyId, gracePeriodMinutes = 60) => {
+  const oldKey = getKeyById(oldKeyId);
+  if (!oldKey) return null;
+
+  const newKey = generateApiKey(oldKey.appName, oldKey.teamId, {
+    appId: oldKey.appId,
+    permissions: oldKey.permissions,
+    allowedTeamIds: oldKey.allowedTeamIds
+  });
+
+  db.prepare(`
+    UPDATE api_keys SET is_active = 0, grace_period_until = ? WHERE id = ?
+  `).run(Date.now() + gracePeriodMinutes * 60 * 1000, oldKeyId);
+
+  return { oldKey: getKeyById(oldKeyId), newKey };
 };
 
 const updateKey = (id, updates = {}) => {
@@ -168,8 +217,8 @@ const ensureTestKey = () => {
   const existing = db.prepare('SELECT id FROM api_keys WHERE key_hash = ?').get(keyHash);
   if (existing) return;
   db.prepare(`
-    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, permissions, allowed_team_ids, is_active, created_at)
-    VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, 1, ?)
+    INSERT INTO api_keys (id, app_id, app_name, key_hash, key_prefix, team_id, permissions, allowed_team_ids, is_active, grace_period_until, created_at)
+    VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, 1, NULL, ?)
   `).run(
     'test-key-id',
     TEST_APP_ID,
@@ -188,6 +237,8 @@ module.exports = {
   getKeysByAppId,
   revokeKey,
   updateKey,
+  setKeyGracePeriod,
+  rotateKey,
   ensureTestKey,
   TEST_APP_ID,
   TEST_API_KEY,

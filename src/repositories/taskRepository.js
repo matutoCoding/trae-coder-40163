@@ -7,10 +7,10 @@ const TaskStatus = {
   FAILED: 'failed'
 };
 
-const createTask = ({ id, appId, audioUrl, meetingName, teamId, callbackUrl, createdAt }) => {
+const createTask = ({ id, appId, audioUrl, meetingName, teamId, callbackUrl, backupCallbackUrl, createdAt }) => {
   const stmt = db.prepare(`
-    INSERT INTO tasks (id, app_id, audio_url, meeting_name, team_id, callback_url, status, created_at)
-    VALUES (@id, @appId, @audioUrl, @meetingName, @teamId, @callbackUrl, @status, @createdAt)
+    INSERT INTO tasks (id, app_id, audio_url, meeting_name, team_id, callback_url, backup_callback_url, status, created_at)
+    VALUES (@id, @appId, @audioUrl, @meetingName, @teamId, @callbackUrl, @backupCallbackUrl, @status, @createdAt)
   `);
   stmt.run({
     id,
@@ -19,6 +19,7 @@ const createTask = ({ id, appId, audioUrl, meetingName, teamId, callbackUrl, cre
     meetingName,
     teamId: teamId || null,
     callbackUrl: callbackUrl || null,
+    backupCallbackUrl: backupCallbackUrl || null,
     status: TaskStatus.PENDING,
     createdAt
   });
@@ -44,6 +45,7 @@ const mapRow = (row) => ({
   meetingName: row.meeting_name,
   teamId: row.team_id,
   callbackUrl: row.callback_url,
+  backupCallbackUrl: row.backup_callback_url,
   status: row.status,
   createdAt: row.created_at,
   startedAt: row.started_at,
@@ -51,6 +53,7 @@ const mapRow = (row) => ({
   errorMessage: row.error_message,
   callbackStatus: row.callback_status,
   callbackAttempts: row.callback_attempts,
+  callbackFailureReason: row.callback_failure_reason,
   lastCallbackAt: row.last_callback_at
 });
 
@@ -81,6 +84,10 @@ const updateTaskStatus = (id, status, extra = {}) => {
   if (extra.lastCallbackAt !== undefined) {
     fields.push('last_callback_at = ?');
     params.push(extra.lastCallbackAt);
+  }
+  if (extra.callbackFailureReason !== undefined) {
+    fields.push('callback_failure_reason = ?');
+    params.push(extra.callbackFailureReason);
   }
 
   params.push(id);

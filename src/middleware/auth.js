@@ -1,4 +1,5 @@
 const { validateKey, ensureTestKey, TEST_APP_ID, TEST_API_KEY } = require('../repositories/apiKeyRepository');
+const { createAuditLog } = require('../repositories/auditLogRepository');
 
 const TEST_KEY_INFO = {
   id: 'test-key-id',
@@ -47,6 +48,20 @@ const authMiddleware = (req, res, next) => {
   req.keyInfo = keyInfo;
   req.permissions = keyInfo.permissions;
   req.allowedTeamIds = keyInfo.allowedTeamIds;
+
+  req.audit = (action, taskId, detail) => {
+    createAuditLog({
+      appId: keyInfo.appId,
+      keyId: keyInfo.id,
+      keyPrefix: keyInfo.keyPrefix,
+      appName: keyInfo.appName,
+      action,
+      taskId: taskId || null,
+      detail: detail || null,
+      ipAddress: req.ip || null
+    });
+  };
+
   next();
 };
 
@@ -66,22 +81,29 @@ const requirePermission = (...perms) => {
   };
 };
 
-const requireTeamAllowed = (teamId) => {
-  return (req, _res, next) => {
-    const allowed = req.allowedTeamIds;
-    if (!allowed || allowed.length === 0) return next();
-    if (!teamId) return next();
-    if (allowed.includes(teamId)) return next();
-    const err = new Error(`当前 API Key 无权访问团队 ${teamId}`);
-    err.statusCode = 403;
-    err.code = 'TEAM_NOT_ALLOWED';
-    return next(err);
+const checkTeamAllowed = (req, teamId) => {
+  const allowed = req.allowedTeamIds;
+  if (!allowed || allowed.length === 0) return null;
+  if (!teamId) return null;
+  if (allowed.includes(teamId)) return null;
+  return {
+    httpStatus: 403,
+    code: 'TEAM_NOT_ALLOWED',
+    message: `当前 API Key 无权访问团队 '${teamId}'`
   };
+};
+
+const isTeamAllowed = (req, teamId) => {
+  const allowed = req.allowedTeamIds;
+  if (!allowed || allowed.length === 0) return true;
+  if (!teamId) return true;
+  return allowed.includes(teamId);
 };
 
 module.exports = {
   authMiddleware,
   requirePermission,
-  requireTeamAllowed,
+  checkTeamAllowed,
+  isTeamAllowed,
   default: authMiddleware
 };

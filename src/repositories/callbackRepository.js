@@ -1,13 +1,13 @@
 const db = require('../db');
 
-const createCallbackLog = ({ taskId, url, payload, statusCode, responseBody, attempt, createdAt, nextRetryAt }) => {
+const createCallbackLog = ({ taskId, url, payload, statusCode, responseBody, failureReason, attempt, createdAt, nextRetryAt }) => {
   const stmt = db.prepare(`
-    INSERT INTO callback_logs (task_id, url, payload, status_code, response_body, attempt, created_at, next_retry_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO callback_logs (task_id, url, payload, status_code, response_body, failure_reason, attempt, created_at, next_retry_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const info = stmt.run(
     taskId, url, payload || null, statusCode || null, responseBody || null,
-    attempt || 1, createdAt, nextRetryAt || null
+    failureReason || null, attempt || 1, createdAt, nextRetryAt || null
   );
   return info.lastInsertRowid;
 };
@@ -24,6 +24,7 @@ const getCallbackLogsByTaskId = (taskId, limit = 50) => {
     payload: r.payload,
     statusCode: r.status_code,
     responseBody: r.response_body,
+    failureReason: r.failure_reason,
     attempt: r.attempt,
     createdAt: r.created_at,
     nextRetryAt: r.next_retry_at
@@ -44,6 +45,7 @@ const getLatestFailedLog = (taskId) => {
     payload: row.payload,
     statusCode: row.status_code,
     responseBody: row.response_body,
+    failureReason: row.failure_reason,
     attempt: row.attempt,
     createdAt: row.created_at,
     nextRetryAt: row.next_retry_at

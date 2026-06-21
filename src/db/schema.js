@@ -12,6 +12,7 @@ const initDatabase = () => {
       permissions TEXT NOT NULL DEFAULT '["admin"]',
       allowed_team_ids TEXT,
       is_active INTEGER NOT NULL DEFAULT 1,
+      grace_period_until INTEGER,
       created_at INTEGER NOT NULL,
       revoked_at INTEGER
     );
@@ -26,6 +27,7 @@ const initDatabase = () => {
       meeting_name TEXT NOT NULL,
       team_id TEXT,
       callback_url TEXT,
+      backup_callback_url TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at INTEGER NOT NULL,
       started_at INTEGER,
@@ -33,6 +35,7 @@ const initDatabase = () => {
       error_message TEXT,
       callback_status TEXT,
       callback_attempts INTEGER DEFAULT 0,
+      callback_failure_reason TEXT,
       last_callback_at INTEGER
     );
 
@@ -48,6 +51,7 @@ const initDatabase = () => {
       payload TEXT,
       status_code INTEGER,
       response_body TEXT,
+      failure_reason TEXT,
       attempt INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL,
       next_retry_at INTEGER,
@@ -56,6 +60,23 @@ const initDatabase = () => {
 
     CREATE INDEX IF NOT EXISTS idx_callback_logs_task_id ON callback_logs(task_id);
     CREATE INDEX IF NOT EXISTS idx_callback_logs_next_retry ON callback_logs(next_retry_at);
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      app_id TEXT NOT NULL,
+      key_id TEXT,
+      key_prefix TEXT,
+      app_name TEXT,
+      action TEXT NOT NULL,
+      task_id TEXT,
+      detail TEXT,
+      ip_address TEXT,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_task_id ON audit_logs(task_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_app_id ON audit_logs(app_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
 
     CREATE TABLE IF NOT EXISTS participants (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

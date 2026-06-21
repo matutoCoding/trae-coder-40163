@@ -1,6 +1,6 @@
 const express = require('express');
 const taskService = require('../services/taskService');
-const { authMiddleware, requirePermission } = require('../middleware/auth');
+const { authMiddleware, requirePermission, checkTeamAllowed, isTeamAllowed } = require('../middleware/auth');
 const {
   validateSubmitTask,
   validateFeedback,
@@ -12,8 +12,10 @@ const {
   getKeyById,
   getKeysByAppId,
   revokeKey,
-  updateKey
+  updateKey,
+  rotateKey
 } = require('../repositories/apiKeyRepository');
+const { queryAuditLogs } = require('../repositories/auditLogRepository');
 
 const router = express.Router();
 
@@ -21,45 +23,22 @@ router.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'voice-transcription-service',
-    version: '1.1.0',
+    version: '1.2.0',
     timestamp: Date.now()
   });
 });
 
-function checkTeamAllowed(req, teamId) {
-  const allowed = req.allowedTeamIds;
-  if (!allowed || allowed.length === 0) return null;
-  if (!teamId) return null;
-  if (allowed.includes(teamId)) return null;
-  return {
-    httpStatus: 403,
-    code: 'TEAM_NOT_ALLOWED',
-    message: `当前 API Key 无权访问团队 '${teamId}'`
-  };
-}
-
-function filterListByAllowedTeams(req, filters) {
-  const allowed = req.allowedTeamIds;
-  if (!allowed || allowed.length === 0) return filters;
-  if (!filters.teamId) {
-    if (!allowed.includes(filters.teamId)) {
-      filters.teamId = allowed[0];
-    }
-    return filters;
-  }
-  filters.allowedTeamIds = allowed;
-  return filters;
-}
-
 // ============ API Key 管理（admin only） ============
 
 router.post('/api-keys', authMiddleware, requirePermission('admin'), validateCreateApiKey, (req, res) => {
-  const { appName, teamId, permissions, allowedTeamIds } = req.body;
+  const { appName, teamId, permissions, allowedTeamIds, gracePeriodMinutes } = req.body;
   const created = generateApiKey(appName, teamId || null, {
     permissions,
     allowedTeamIds,
-    appId: req.appId
+    appId: req.appId,
+    gracePeriodMinutes: gracePeriodMinutes || undefined
   });
+  req.audit('api_key.create', null, `创建密钥 ${created.keyPrefix}...`);
   res.status(201).json({
     code: 'SUCCESS',
     message: 'API Key 创建成功，请妥善保管，仅本次可见',
@@ -72,13 +51,15 @@ router.post('/api-keys', authMiddleware, requirePermission('admin'), validateCre
       teamId: created.teamId,
       permissions: created.permissions,
       allowedTeamIds: created.allowedTeamIds,
+      gracePeriodUntil: created.gracePeriodUntil,
+      status: 'effective',
       createdAt: created.createdAt
     }
   });
 });
 
-router.get('/api-keys', authMiddleware, requirePermission('admin'), (_req, res) => {
-  const keys = getKeysByAppId(_req.appId);
+router.get('/api-keys', authMiddleware, requirePermission('admin'), (req, res) => {
+  const keys = getKeysByAppId(req.appId);
   res.json({
     code: 'SUCCESS',
     message: '查询成功',
@@ -92,6 +73,8 @@ router.get('/api-keys', authMiddleware, requirePermission('admin'), (_req, res) 
         permissions: k.permissions,
         allowedTeamIds: k.allowedTeamIds,
         isActive: k.isActive,
+        status: k.status,
+        gracePeriodUntil: k.gracePeriodUntil,
         createdAt: k.createdAt,
         revokedAt: k.revokedAt
       })),
@@ -117,6 +100,8 @@ router.get('/api-keys/:id', authMiddleware, requirePermission('admin'), (req, re
       permissions: key.permissions,
       allowedTeamIds: key.allowedTeamIds,
       isActive: key.isActive,
+      status: key.status,
+      gracePeriodUntil: key.gracePeriodUntil,
       createdAt: key.createdAt,
       revokedAt: key.revokedAt
     }
@@ -130,6 +115,7 @@ router.put('/api-keys/:id', authMiddleware, requirePermission('admin'), (req, re
   }
   const { appName, permissions, allowedTeamIds } = req.body || {};
   const updated = updateKey(req.params.id, { appName, permissions, allowedTeamIds });
+  req.audit('api_key.update', null, `更新密钥 ${updated.keyPrefix}...`);
   res.json({
     code: 'SUCCESS',
     message: '更新成功',
@@ -148,16 +134,91 @@ router.delete('/api-keys/:id', authMiddleware, requirePermission('admin'), (req,
     return res.status(404).json({ code: 'KEY_NOT_FOUND', message: 'API Key 不存在或无权访问' });
   }
   revokeKey(req.params.id);
-  res.json({ code: 'SUCCESS', message: '已吊销', data: { id: req.params.id, isActive: false } });
+  req.audit('api_key.revoke', null, `吊销密钥 ${existing.keyPrefix}...`);
+  res.json({ code: 'SUCCESS', message: '已吊销', data: { id: req.params.id, isActive: false, status: 'revoked' } });
+});
+
+router.post('/api-keys/:id/rotate', authMiddleware, requirePermission('admin'), (req, res) => {
+  const existing = getKeyById(req.params.id);
+  if (!existing || existing.appId !== req.appId) {
+    return res.status(404).json({ code: 'KEY_NOT_FOUND', message: 'API Key 不存在或无权访问' });
+  }
+  const { gracePeriodMinutes = 60 } = req.body || {};
+  const result = rotateKey(req.params.id, gracePeriodMinutes);
+  if (!result) {
+    return res.status(400).json({ code: 'ROTATE_FAILED', message: '密钥轮换失败' });
+  }
+  req.audit('api_key.rotate', null, `轮换密钥 ${result.oldKey.keyPrefix}... → ${result.newKey.keyPrefix}...`);
+  res.json({
+    code: 'SUCCESS',
+    message: '密钥已轮换，旧密钥进入宽限期',
+    data: {
+      oldKey: {
+        id: result.oldKey.id,
+        keyPrefix: result.oldKey.keyPrefix,
+        status: result.oldKey.status,
+        gracePeriodUntil: result.oldKey.gracePeriodUntil
+      },
+      newKey: {
+        id: result.newKey.id,
+        appId: result.newKey.appId,
+        appName: result.newKey.appName,
+        apiKey: result.newKey.apiKey,
+        keyPrefix: result.newKey.keyPrefix,
+        permissions: result.newKey.permissions,
+        allowedTeamIds: result.newKey.allowedTeamIds,
+        status: 'effective',
+        createdAt: result.newKey.createdAt
+      }
+    }
+  });
+});
+
+// ============ 审计日志（admin only） ============
+
+router.get('/audit/logs', authMiddleware, requirePermission('admin'), (req, res) => {
+  const { taskId, action, startTime, endTime, limit, offset } = req.query;
+  const result = queryAuditLogs({
+    appId: req.appId,
+    taskId: taskId || null,
+    action: action || null,
+    startTime: startTime ? Number(startTime) : null,
+    endTime: endTime ? Number(endTime) : null,
+    limit: limit ? Math.min(Number(limit), 200) : 50,
+    offset: offset ? Number(offset) : 0
+  });
+  res.json({
+    code: 'SUCCESS',
+    message: '查询成功',
+    data: {
+      logs: result.logs.map((l) => ({
+        id: l.id,
+        keyId: l.keyId,
+        keyPrefix: l.keyPrefix,
+        appName: l.appName,
+        action: l.action,
+        taskId: l.taskId,
+        detail: l.detail,
+        createdAt: l.createdAt
+      })),
+      pagination: {
+        total: result.total,
+        limit: result.limit,
+        offset: result.offset,
+        hasMore: result.offset + result.logs.length < result.total
+      }
+    }
+  });
 });
 
 // ============ 任务相关 ============
 
 router.post('/tasks/batch', authMiddleware, requirePermission('tasks:read'), validateBatchGetTasks, (req, res) => {
-  const result = taskService.batchGetTaskSummaries(req.body.taskIds, req.appId);
+  const result = taskService.batchGetTaskSummaries(req.body.taskIds, req.appId, req.allowedTeamIds);
   if (result.error) {
     return res.status(result.httpStatus || 400).json({ code: result.error.code, message: result.error.message });
   }
+  req.audit('task.batch_query', null, `批量查询 ${req.body.taskIds.length} 个任务`);
   res.json({ code: 'SUCCESS', message: '批量查询完成', data: result.data });
 });
 
@@ -167,6 +228,7 @@ router.post('/tasks', authMiddleware, requirePermission('tasks:write'), validate
     return res.status(teamErr.httpStatus).json({ code: teamErr.code, message: teamErr.message });
   }
   const result = taskService.submitTask(req.body, req.appId);
+  req.audit('task.submit', result.taskId, `提交任务 ${result.taskId}`);
   res.status(201).json({
     code: 'SUCCESS',
     message: '转写任务已提交',
@@ -230,15 +292,16 @@ router.get('/tasks', authMiddleware, requirePermission('tasks:read'), (req, res)
 
 router.get('/tasks/:taskId', authMiddleware, requirePermission('tasks:read'), (req, res) => {
   const { taskId } = req.params;
-  const result = taskService.getTaskResult(taskId, req.appId);
+  const result = taskService.getTaskResult(taskId, req.appId, req.allowedTeamIds);
   if (result.error) {
     return res.status(result.httpStatus || 400).json({ code: result.error.code, message: result.error.message });
   }
+  req.audit('task.query', taskId);
   res.json({ code: 'SUCCESS', message: '查询成功', data: result.data });
 });
 
 router.get('/tasks/:taskId/callbacks', authMiddleware, requirePermission('tasks:read'), (req, res) => {
-  const result = taskService.getCallbackHistory(req.params.taskId, req.appId);
+  const result = taskService.getCallbackHistory(req.params.taskId, req.appId, req.allowedTeamIds);
   if (result.error) {
     return res.status(result.httpStatus || 400).json({ code: result.error.code, message: result.error.message });
   }
@@ -246,10 +309,11 @@ router.get('/tasks/:taskId/callbacks', authMiddleware, requirePermission('tasks:
 });
 
 router.post('/tasks/:taskId/callbacks/retry', authMiddleware, requirePermission('tasks:write'), (req, res) => {
-  const result = taskService.retryCallback(req.params.taskId, req.appId);
+  const result = taskService.retryCallback(req.params.taskId, req.appId, req.allowedTeamIds);
   if (result.error) {
     return res.status(result.httpStatus || 400).json({ code: result.error.code, message: result.error.message });
   }
+  req.audit('callback.retry', req.params.taskId, `手动重放第 ${result.data.attempt} 次`);
   res.status(202).json({ code: 'SUCCESS', message: '已触发回调重放', data: result.data });
 });
 
@@ -263,6 +327,7 @@ router.post('/tasks/:taskId/feedback', authMiddleware, requirePermission('feedba
   if (result.error) {
     return res.status(result.httpStatus || 400).json({ code: result.error.code, message: result.error.message, details: result.error.details || null });
   }
+  req.audit('feedback.submit', taskId, `提交 ${result.data.appliedCount} 条修正`);
   res.json({ code: 'SUCCESS', message: '反馈已接收', data: result.data });
 });
 

@@ -44,7 +44,7 @@ const generateSignature = (taskId, timestamp) => {
 
 class TaskService {
   submitTask(payload, appId) {
-    const { audioUrl, meetingName, teamId, callbackUrl, participants = [] } = payload;
+    const { audioUrl, meetingName, teamId, callbackUrl, backupCallbackUrl, participants = [] } = payload;
     const taskId = uuidv4();
     const createdAt = now();
 
@@ -55,6 +55,7 @@ class TaskService {
       meetingName,
       teamId,
       callbackUrl,
+      backupCallbackUrl,
       createdAt
     });
 
@@ -140,10 +141,11 @@ class TaskService {
       updateTaskStatus(taskId, TaskStatus.COMPLETED, {
         callbackStatus: 'delivered',
         callbackAttempts: attempt,
+        callbackFailureReason: null,
         lastCallbackAt: ts
       });
       createCallbackLog({
-        taskId, url, payload, statusCode: 200, attempt, createdAt: ts, nextRetryAt: null
+        taskId, url, payload, statusCode: 200, failureReason: null, attempt, createdAt: ts, nextRetryAt: null
       });
       return;
     }
@@ -182,24 +184,35 @@ class TaskService {
     doRequest(url, payload, (err, statusCode, responseBody) => {
       const success = !err && statusCode >= 200 && statusCode < 300;
       const cbStatus = success ? 'delivered' : 'failed';
+      let failureReason = null;
+      if (err) {
+        failureReason = 'network_error';
+      } else if (statusCode < 200 || statusCode >= 300) {
+        failureReason = 'non_2xx';
+      }
+
       updateTaskStatus(taskId, TaskStatus.COMPLETED, {
         callbackStatus: cbStatus,
         callbackAttempts: attempt,
+        callbackFailureReason: failureReason,
         lastCallbackAt: ts
       });
       createCallbackLog({
         taskId, url, payload,
         statusCode: statusCode || null,
         responseBody: responseBody || (err ? err.message : null),
+        failureReason,
         attempt,
         createdAt: ts,
         nextRetryAt: success ? null : this._nextRetryAt(attempt)
       });
 
       if (!success && attempt < CALLBACK_MAX_RETRIES) {
+        const task = getTaskById(taskId);
+        const nextUrl = (attempt === 1 && task && task.backupCallbackUrl) ? task.backupCallbackUrl : url;
         const delay = CALLBACK_RETRY_DELAYS[attempt - 1] || 120000;
         setTimeout(() => {
-          this._fireCallbackWithRetry(url, taskId, attempt + 1);
+          this._fireCallbackWithRetry(nextUrl, taskId, attempt + 1);
         }, delay);
       }
     });
@@ -210,12 +223,16 @@ class TaskService {
     return now() + delay;
   }
 
-  getTaskResult(taskId, appId) {
+  getTaskResult(taskId, appId, allowedTeamIds) {
     const task = appId
       ? getTaskByIdAndAppId(taskId, appId)
       : getTaskById(taskId);
     if (!task) {
       return { error: { code: 'TASK_NOT_FOUND', message: '任务不存在或无权访问' }, httpStatus: 404 };
+    }
+    const hasTeamRestriction = Array.isArray(allowedTeamIds) && allowedTeamIds.length > 0;
+    if (hasTeamRestriction && task.teamId && !allowedTeamIds.includes(task.teamId)) {
+      return { error: { code: 'TEAM_NOT_ALLOWED', message: '当前 API Key 无权访问此团队的任务' }, httpStatus: 403 };
     }
 
     const participants = getParticipantsByTaskId(taskId);
@@ -228,12 +245,15 @@ class TaskService {
 
     const callbackInfo = task.callbackUrl ? {
       url: task.callbackUrl,
+      backupUrl: task.backupCallbackUrl || null,
       status: task.callbackStatus,
       attempts: task.callbackAttempts || 0,
+      failureReason: task.callbackFailureReason || null,
       lastCallbackAt: task.lastCallbackAt,
       recentLogs: callbackLogs.slice(0, 3).map((l) => ({
         attempt: l.attempt,
         statusCode: l.statusCode,
+        failureReason: l.failureReason,
         createdAt: l.createdAt
       }))
     } : null;
@@ -564,27 +584,34 @@ class TaskService {
     return getTeamLearningOverview(teamId, appId);
   }
 
-  getCallbackHistory(taskId, appId) {
+  getCallbackHistory(taskId, appId, allowedTeamIds) {
     const task = appId ? getTaskByIdAndAppId(taskId, appId) : getTaskById(taskId);
     if (!task) {
       return { error: { code: 'TASK_NOT_FOUND', message: '任务不存在或无权访问' }, httpStatus: 404 };
     }
+    const hasTeamRestriction = Array.isArray(allowedTeamIds) && allowedTeamIds.length > 0;
+    if (hasTeamRestriction && task.teamId && !allowedTeamIds.includes(task.teamId)) {
+      return { error: { code: 'TEAM_NOT_ALLOWED', message: '当前 API Key 无权访问此团队的任务' }, httpStatus: 403 };
+    }
     if (!task.callbackUrl) {
-      return { data: { taskId, url: null, logs: [], status: task.callbackStatus || 'not_configured' } };
+      return { data: { taskId, url: null, backupUrl: null, logs: [], status: task.callbackStatus || 'not_configured', failureReason: null } };
     }
     const logs = getCallbackLogsByTaskId(taskId, 50);
     return {
       data: {
         taskId,
         url: task.callbackUrl,
+        backupUrl: task.backupCallbackUrl || null,
         status: task.callbackStatus || 'pending',
         attempts: task.callbackAttempts || 0,
+        failureReason: task.callbackFailureReason || null,
         lastCallbackAt: task.lastCallbackAt,
         logs: logs.map((l) => ({
           id: l.id,
           attempt: l.attempt,
           statusCode: l.statusCode,
           responseBody: l.responseBody,
+          failureReason: l.failureReason,
           createdAt: l.createdAt,
           nextRetryAt: l.nextRetryAt
         }))
@@ -592,16 +619,23 @@ class TaskService {
     };
   }
 
-  retryCallback(taskId, appId) {
+  retryCallback(taskId, appId, allowedTeamIds) {
     const task = appId ? getTaskByIdAndAppId(taskId, appId) : getTaskById(taskId);
     if (!task) {
       return { error: { code: 'TASK_NOT_FOUND', message: '任务不存在或无权访问' }, httpStatus: 404 };
+    }
+    const hasTeamRestriction = Array.isArray(allowedTeamIds) && allowedTeamIds.length > 0;
+    if (hasTeamRestriction && task.teamId && !allowedTeamIds.includes(task.teamId)) {
+      return { error: { code: 'TEAM_NOT_ALLOWED', message: '当前 API Key 无权访问此团队的任务' }, httpStatus: 403 };
     }
     if (!task.callbackUrl) {
       return { error: { code: 'CALLBACK_NOT_CONFIGURED', message: '该任务未配置回调地址' }, httpStatus: 400 };
     }
     const failed = getLatestFailedLog(taskId);
-    const attempt = failed ? failed.attempt + 1 : (task.callbackAttempts || 0) + 1;
+    if (!failed) {
+      return { error: { code: 'NO_FAILED_CALLBACK', message: '该任务没有失败的回调记录，无需重放' }, httpStatus: 400 };
+    }
+    const attempt = failed.attempt + 1;
     if (attempt > CALLBACK_MAX_RETRIES) {
       return { error: { code: 'MAX_RETRIES_EXCEEDED', message: `重放次数超过上限(${CALLBACK_MAX_RETRIES}次)` }, httpStatus: 400 };
     }
@@ -616,13 +650,14 @@ class TaskService {
     };
   }
 
-  batchGetTaskSummaries(taskIds, appId) {
+  batchGetTaskSummaries(taskIds, appId, allowedTeamIds) {
     if (!Array.isArray(taskIds) || taskIds.length === 0) {
       return { error: { code: 'EMPTY_TASK_IDS', message: 'taskIds 必须是非空数组' }, httpStatus: 400 };
     }
     if (taskIds.length > 100) {
       return { error: { code: 'TOO_MANY_TASKS', message: '单次最多查询 100 个任务' }, httpStatus: 400 };
     }
+    const hasTeamRestriction = Array.isArray(allowedTeamIds) && allowedTeamIds.length > 0;
     const results = [];
     for (const tid of taskIds) {
       if (!tid || typeof tid !== 'string') {
@@ -638,6 +673,10 @@ class TaskService {
           } else {
             results.push({ taskId: tid, code: 'NOT_FOUND', status: 'not_found', error: '任务不存在' });
           }
+          continue;
+        }
+        if (hasTeamRestriction && task.teamId && !allowedTeamIds.includes(task.teamId)) {
+          results.push({ taskId: tid, code: 'FORBIDDEN', status: 'forbidden', error: '当前 API Key 无权访问此团队的任务' });
           continue;
         }
         if (task.status !== TaskStatus.COMPLETED) {
